@@ -35,6 +35,7 @@ Finally, launch the software:
 python demo.py
 ```
 
+**Brief tutorial:** Click the <u>left mouse button</u> to add a **positive** point prompt, and the <u>right mouse button</u> to add a **negative** point prompt. Press <kbd>Q</kbd> to undo the previous point prompt, press <kbd>E</kbd> to clear all prompts.
 
 ## Contact
 

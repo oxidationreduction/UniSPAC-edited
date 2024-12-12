@@ -4,21 +4,20 @@ from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QWheelEvent
 from PyQt5.QtCore import Qt,QPoint
 
 import zarr
-import math
+# import math
 import numpy as np
-import random
+# import random
 import torch
-import torch.nn as nn
+# import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
+# from tqdm.auto import tqdm
 from skimage.measure import label
 from models.segNeuro import segEM2d, segEM3d
 from PIL import Image
 from scipy.stats import multivariate_normal
 # from waterz import get_segmentation
 
-# from utils.dataloader import Dataset_2D_Zebrafinch_Train,collate_fn_2D_Zebrafinch_Train
 
 class CustomSlider(QSlider):
     def __init__(self, orientation, parent=None):
