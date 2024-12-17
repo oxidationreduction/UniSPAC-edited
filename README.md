@@ -7,7 +7,7 @@
 ***
 ### System requirements
 
-It is recommended to deploy the software on a Linux system. Pre-install PyQt5 and PyTorch. Devices that support cuda allow for smoother software usage. 
+It is recommended to deploy the software on a Linux system. Pre-install PyQt5 (Qt) and PyTorch. Devices that support cuda allow for smoother software usage. 
 
 ### Quick Start
 
@@ -24,7 +24,7 @@ pip install -r requirements.txt
 Download test data and checkpoints：
 
 ```shell
-./download.sh
+bash ./download.sh
 ```
 
 The total files after data and model decompression take up **9.3GB** of storage, so please make sure you have enough capacity. See the downloaded model weights in the `checkpoints` folder and the Hemi-Brain-ROI-1 test data in the `data` folder. 
