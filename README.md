@@ -15,7 +15,7 @@ Set up the software environment:
 
 ```shell
 conda create -n UniSPAC python=3.9
-source activate UniSPAC
+conda activate UniSPAC
 git clone https://github.com/ddd9898/UniSPAC.git
 cd UniSPAC
 pip install -r requirements.txt
