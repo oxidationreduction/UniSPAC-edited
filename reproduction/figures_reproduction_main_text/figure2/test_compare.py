@@ -26,7 +26,7 @@ matplotlib.rcParams['ps.fonttype'] = 42
 
 
 '''
-图2a的代码
+图2b的代码
 '''
 
 NUM_SAMPLES = 1
