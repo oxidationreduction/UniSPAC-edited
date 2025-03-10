@@ -42,4 +42,8 @@ LSDs 预测：2D-UNet，1 通道输入，6 通道输出。
 2. 存在正样本点：只分割正样本点所在的神经元
 3. 只存在负样本点：分割所有神经元，但是不分割负样本点所在的神经元
 
-### 
+### 三种训练模式
+
+1. 基本款：包含 binary_cross_entropy 和 DiceLoss
+2. 增强款：用于跨数据种类场景，在基本款基础上增加 `loss3 = torch.sum(y_mask * gt_affinity) / torch.sum(gt_affinity)`，引导模型在真实亲和力区域内产生更高的预测值，能显著提高神经元边界的预测质量
+3. 持续学习款：ACRLSD 不从预训练数据加载，也参与训练。在增强款基础上增加 `loss_affinity`，使用 MSEloss 计算 LSDs 和亲和度预测各自的损失。使用 avalanche 持续学习库，依次学习各部分数据。
