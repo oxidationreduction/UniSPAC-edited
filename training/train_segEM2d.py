@@ -179,14 +179,14 @@ if __name__ == '__main__':
     model = model.to(device)
 
     ##装载数据
-    train_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/funke/hemi/training/', split='train', crop_size=128,
+    train_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/hemi/training/', split='train', crop_size=128,
                                             require_lsd=False, require_xz_yz=True)
-    val_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/funke/hemi/training/', split='val', crop_size=128,
+    val_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/hemi/training/', split='val', crop_size=128,
                                           require_lsd=False, require_xz_yz=True)
 
-    train_dataset_2 = Dataset_2D_fib25_Train(data_dir='./data/funke/fib25/training/', split='train', crop_size=128,
+    train_dataset_2 = Dataset_2D_fib25_Train(data_dir='./data/fib25/training/', split='train', crop_size=128,
                                              require_lsd=False, require_xz_yz=True)
-    val_dataset_2 = Dataset_2D_fib25_Train(data_dir='./data/funke/fib25/training/', split='val', crop_size=128,
+    val_dataset_2 = Dataset_2D_fib25_Train(data_dir='./data/fib25/training/', split='val', crop_size=128,
                                            require_lsd=False, require_xz_yz=True)
 
     # train_dataset_3 = Dataset_2D_cremi_Train(data_dir='../data/CREMI/', split='train', crop_size=128, require_lsd=False)
