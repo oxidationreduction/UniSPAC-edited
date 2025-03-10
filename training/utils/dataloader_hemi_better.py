@@ -17,7 +17,7 @@ from copy import deepcopy
 class Dataset_2D_hemi_Train(Dataset):
     def __init__(
         self,
-        data_dir='./data/funke/hemi/training/',  # 数据的路径
+        data_dir='./data/hemi/training/',  # 数据的路径
         split='train', # 划分方式
         crop_size=None, #切割尺寸
         padding_size=8,
@@ -386,7 +386,7 @@ def collate_fn_2D_hemi_Train(batch):
 class Dataset_3D_hemi_Train(Dataset):
     def __init__(
         self,
-        data_dir='./data/funke/hemi/training/',  # 数据的路径
+        data_dir='./data/hemi/training/',  # 数据的路径
         split='train', # 划分方式
         crop_size=None, #切割尺寸
         num_slices = 8,
@@ -764,7 +764,7 @@ def collate_fn_3D_hemi_Train(batch):
 class SAM_Dataset_2D_hemi_Train(Dataset):
     def __init__(
         self,
-        data_dir='./data/funke/hemi/training/',  # 数据的路径
+        data_dir='./data/hemi/training/',  # 数据的路径
         split='train', # 划分方式
         crop_size=None, #切割尺寸
         padding_size=8,
