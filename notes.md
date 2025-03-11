@@ -75,4 +75,7 @@ LSDs 预测：3D-UNet，1 通道输入，10 通道输出。
 
 ### 两种模型版本
 
-普通版：利用
+普通版：输入只有原图和 prompt，利用原图和 prompt 生成第一层的 mask 并替换生成x_raw_new，需要 2D 模型协作。
+
+trace 版：输入还包括第一层的 ground truth mask，利用其替换第一层的 mask 并生成 x_raw_new。不包括 2D 掩码生成 `model_mask_2d`部分，纯 3D 模型。
+
