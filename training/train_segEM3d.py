@@ -140,7 +140,6 @@ class ACRLSD_3d(torch.nn.Module):
         
         self.lsd_predict = torch.nn.Conv3d(in_channels=12,out_channels=10, kernel_size=1)  #最终输出层的卷积操作
 
-
         # create our network, 10 input channels in the lsds data and 1 input channels in the raw data
         self.model_affinity = UNet3d(
             in_channels=11, #输入的图像通道数
@@ -180,7 +179,6 @@ class segEM_3d(torch.nn.Module):
         for param in self.model_mask_2d.parameters():
             param.requires_grad = False
         
-        
         ##For affinity prediction
         self.model_affinity = ACRLSD_3d()
         # model_path = './output/checkpoints/ACRLSD_3D(hemi+fib25+cremi)_Best_in_val.model' 
@@ -189,7 +187,6 @@ class segEM_3d(torch.nn.Module):
         self.model_affinity.load_state_dict(weights)
         for param in self.model_affinity.parameters():
             param.requires_grad = False
-            
 
         # create our network, 3 input channels in the affinity data and 1 input channels in the raw data
         self.model_mask = UNet3d(

@@ -161,8 +161,7 @@ class ACRLSD_3d(torch.nn.Module):
         y_affinity = self.affinity_predict(self.model_affinity(y_concat))
 
         return y_lsds,y_affinity
-
-    
+ 
 
 class segEM_3d_trace(torch.nn.Module):
     def __init__(
@@ -179,7 +178,6 @@ class segEM_3d_trace(torch.nn.Module):
         for param in self.model_affinity.parameters():
             param.requires_grad = False
             
-
         # create our network, 3 input channels in the affinity data and 1 input channels in the raw data
         self.model_mask = UNet3d(
             in_channels=4, #输入的图像通道数

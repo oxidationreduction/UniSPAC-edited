@@ -44,6 +44,35 @@ LSDs 预测：2D-UNet，1 通道输入，6 通道输出。
 
 ### 三种训练模式
 
-1. 基本款：包含 binary_cross_entropy 和 DiceLoss
-2. 增强款：用于跨数据种类场景，在基本款基础上增加 `loss3 = torch.sum(y_mask * gt_affinity) / torch.sum(gt_affinity)`，引导模型在真实亲和力区域内产生更高的预测值，能显著提高神经元边界的预测质量
-3. 持续学习款：ACRLSD 不从预训练数据加载，也参与训练。在增强款基础上增加 `loss_affinity`，使用 MSEloss 计算 LSDs 和亲和度预测各自的损失。使用 avalanche 持续学习库，依次学习各部分数据。
+1. 基本款：包含 binary_cross_entropy 和 DiceLoss。
+2. 增强款：用于跨数据种类场景，在基本款基础上增加 `loss3 = torch.sum(y_mask * gt_affinity) / torch.sum(gt_affinity)`，引导模型在真实亲和力区域内产生更高的预测值，能显著提高神经元边界的预测质量。（原理：边界区 `gt_affinity=1`，其对应的 `y_mask` 越接近 0 越好，越能清晰区分不同的神经元）
+3. 持续学习款：ACRLSD 不从预训练数据加载，也从零开始参与训练。在增强款基础上增加 `loss_affinity`，使用 MSEloss 计算 LSDs 和亲和度预测各自的损失。使用 avalanche 持续学习库，依次学习各部分数据。
+
+## UniSPAC-3D
+
+### 模型结构
+
+2D 掩码生成 `model_mask_2d`：UniSPAC-2D，从预训练模型加载
+3D 亲和度预测 `model_affinity`：ACRLSD-3D，从预训练模型加载
+3D 掩码生成 `model_mask`：3D-UNet
+
+### 数据流
+
+0. 输入数据 `x_raw: shape = (Batch * channel * dim_x * dim_y * dim_z)`（一组 1 通道灰度图），`x_prompt: shape = (Batch * channel * dim_x * dim_y * dim_z)`（一组 1 通道矩阵）。
+1. `model_mask_2d(x_raw[slice0], x_prompt) -> y_mask_slice0, y_lsds_slice0, y_affinity_slice0`：用于获取第一张切片的 mask，只有 `y_mask_slice0` （2 通道）有用。
+2. `model_affinity(x_raw) -> y_lsds, y_affinity`：用于生成切片组的LSDs（10 通道）和亲和图（3 通道）。
+3. `x_raw_new[:,0,:,:,0] = (y_mask2d_slice0.detach().squeeze()>0.5) + 0`：将切片组的第一张切片替换为第一步生成的第一张切片的 mask，转化为二值类型以确定神经元掩码。
+4. `model_mask(concat([x_raw_new, y_affinity], dim=1)) -> y_mask3d`：输出 3D 掩码结果（1 通道）。
+
+### ACRLSD-3D
+
+LSDs 预测：3D-UNet，1 通道输入，10 通道输出。
+亲和度预测：3D-UNet，11 通道输入（原始数据 x 和 LSDs 进行拼接），3 通道输出。
+
+1. 输入：原数据 `x`（1 通道灰度图）
+2. `lsd_predict(x)` -> `y_lsds`（10 通道）
+3. `affinity_predict([x, y_lsds])` -> `y_affinity`（3 通道）
+
+### 两种模型版本
+
+普通版：利用
