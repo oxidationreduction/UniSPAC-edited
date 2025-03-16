@@ -2,6 +2,7 @@ import logging
 import os
 import random
 
+import joblib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -79,7 +80,7 @@ class segEM2d(torch.nn.Module):
         ##For affinity prediction
         self.model_affinity = ACRLSD()
         # model_path = './output/checkpoints/ACRLSD_2D(hemi+fib25+cremi)_Best_in_val.model' 
-        model_path = './output/checkpoints/ACRLSD_2D(hemi+fib25)_Best_in_val.model'
+        model_path = './output/checkpoints/ACRLSD_2D(fib25)_Best_in_val.model'
         weights = torch.load(model_path, map_location=torch.device('cpu'))
         self.model_affinity.load_state_dict(weights)
         for param in self.model_affinity.parameters():
@@ -156,10 +157,10 @@ def model_step(model, optimizer, input_image, input_prompt, gt_binary_mask, gt_a
 
 if __name__ == '__main__':
     ##设置超参数
-    training_epochs = 10000
+    training_epochs = 1000
     learning_rate = 1e-4
-    batch_size = 32
-    Save_Name = 'segEM2d(hemi+fib25)wloss-{}'.format(WEIGHT_LOSS3)
+    batch_size = 300
+    Save_Name = 'segEM2d(fib25)wloss-{}'.format(WEIGHT_LOSS3)
 
     set_seed()
 
@@ -169,45 +170,60 @@ if __name__ == '__main__':
     torch.backends.cudnn.benchmark = True
 
     model = segEM2d()
-    ##多卡训练
+    #多卡训练
     # 一机多卡设置
-    # os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'#设置所有可以使用的显卡，共计四块
-    # device_ids = [0,1,2,3]#选中显卡
-    # model = nn.DataParallel(model, device_ids=device_ids)#并行使用两块
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2' #设置所有可以使用的显卡，共计四块
+    device_ids = [0,1,2] #选中显卡
+    model = nn.DataParallel(model.cuda(), device_ids=device_ids, output_device=device_ids[0])#并行使用两块
     # model = torch.nn.DataParallel(model)  # 默认使用所有的device_ids
 
-    model = model.to(device)
+    # model = model.to(device)
 
     ##装载数据
-    train_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/funke/hemi/training/', split='train', crop_size=128,
-                                            require_lsd=False, require_xz_yz=True)
-    val_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/funke/hemi/training/', split='val', crop_size=128,
-                                          require_lsd=False, require_xz_yz=True)
+    # train_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/funke/hemi/training/', split='train', crop_size=128,
+    #                                         require_lsd=False, require_xz_yz=True)
+    # val_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/funke/hemi/training/', split='val', crop_size=128,
+    #                                       require_lsd=False, require_xz_yz=True)
+    #
+    # train_dataset_2 = Dataset_2D_fib25_Train(data_dir='./data/funke/fib25/training/', split='train', crop_size=128,
+    #                                          require_lsd=False, require_xz_yz=True)
+    # val_dataset_2 = Dataset_2D_fib25_Train(data_dir='./data/funke/fib25/training/', split='val', crop_size=128,
+    #                                        require_lsd=False, require_xz_yz=True)
 
-    train_dataset_2 = Dataset_2D_fib25_Train(data_dir='./data/funke/fib25/training/', split='train', crop_size=128,
-                                             require_lsd=False, require_xz_yz=True)
-    val_dataset_2 = Dataset_2D_fib25_Train(data_dir='./data/funke/fib25/training/', split='val', crop_size=128,
-                                           require_lsd=False, require_xz_yz=True)
+    fib25_data = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/fib25'
+    if os.path.exists(os.path.join(fib25_data, 'fib25_train_no_lsd.joblib')):
+        print("Load data from disk...")
+        train_dataset_2 = joblib.load(os.path.join(fib25_data, 'fib25_train_no_lsd.joblib'))
+        val_dataset_2 = joblib.load(os.path.join(fib25_data, 'fib25_val_no_lsd.joblib'))
+    else:
+        train_dataset_2 = Dataset_2D_fib25_Train(data_dir=os.path.join(fib25_data, 'training'), split='train',
+                                                 crop_size=128,
+                                                 require_lsd=False, require_xz_yz=True)
+        joblib.dump(train_dataset_2, os.path.join(fib25_data, 'fib25_train_no_lsd.joblib'))
+        val_dataset_2 = Dataset_2D_fib25_Train(data_dir=os.path.join(fib25_data, 'training'), split='val',
+                                               crop_size=128,
+                                               require_lsd=False, require_xz_yz=True)
+        joblib.dump(val_dataset_2, os.path.join(fib25_data, 'fib25_val_no_lsd.joblib'))
 
     # train_dataset_3 = Dataset_2D_cremi_Train(data_dir='../data/CREMI/', split='train', crop_size=128, require_lsd=False)
     # val_dataset_3 = Dataset_2D_cremi_Train(data_dir='../data/CREMI/', split='val', crop_size=128, require_lsd=False)
 
-    train_dataset = ConcatDataset([train_dataset_1, train_dataset_2])
-    val_dataset = ConcatDataset([val_dataset_1, val_dataset_2])
+    # train_dataset = ConcatDataset([train_dataset_1, train_dataset_2])
+    # val_dataset = ConcatDataset([val_dataset_1, val_dataset_2])
 
-    # train_dataset = train_dataset_1
-    # val_dataset = val_dataset_1
+    train_dataset = train_dataset_2
+    val_dataset = val_dataset_2
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=14, pin_memory=True,
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=48, pin_memory=True,
                               drop_last=True, collate_fn=collate_fn_2D_hemi_Train)
-    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=14, pin_memory=True,
+    val_loader = DataLoader(val_dataset, batch_size=384, shuffle=False, num_workers=48, pin_memory=True,
                             collate_fn=collate_fn_2D_hemi_Train)
 
     ##创建log日志
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     logfile = './output/log/log_{}.txt'.format(Save_Name)
-    fh = logging.FileHandler(logfile, mode='a')
+    fh = logging.FileHandler(logfile, mode='a', delay=False)
     fh.setLevel(logging.DEBUG)
     ch = logging.StreamHandler()
     ch.setLevel(logging.WARNING)
@@ -241,6 +257,7 @@ if __name__ == '__main__':
     no_improve_count = 0
     with tqdm(total=training_epochs) as pbar:
         while epoch < training_epochs:
+            pbar.set_description(f"Best epoch: {epoch}, loss: {Best_val_loss:.2f}")
             ###################Train###################
             model.train()
             # reset data loader to get random augmentations
@@ -287,7 +304,7 @@ if __name__ == '__main__':
             if Best_val_loss > val_loss:
                 Best_val_loss = val_loss
                 Best_epoch = epoch
-                torch.save(model.state_dict(), './output/checkpoints/{}_Best_in_val.model'.format(Save_Name))
+                torch.save(model.module.state_dict(), './output/checkpoints/{}_Best_in_val.model'.format(Save_Name))
                 no_improve_count = 0
             else:
                 no_improve_count = no_improve_count + 1
@@ -295,6 +312,7 @@ if __name__ == '__main__':
             ##Record
             logging.info("Epoch {}: val_loss = {:.6f},with best val_loss = {:.6f} in epoch {}".format(
                 epoch, val_loss, Best_val_loss, Best_epoch))
+            fh.flush()
             # writer.add_scalar('val_loss', val_loss, epoch)
 
             ##Early stop

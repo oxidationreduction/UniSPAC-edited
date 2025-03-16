@@ -1,3 +1,4 @@
+import os.path
 import random
 
 import albumentations as A  ##一种数据增强库
@@ -39,7 +40,7 @@ class Dataset_2D_fib25_Train(Dataset):
         # data_list = ['trvol-250-1.zarr']
 
         for data_name in data_list:
-            zarr_path = data_dir + data_name
+            zarr_path = os.path.join(data_dir, data_name)
             f = zarr.open(zarr_path, mode='r')
             volumes = f['volumes']
             raw = volumes['raw']  # zyx

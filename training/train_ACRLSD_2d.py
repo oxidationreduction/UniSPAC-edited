@@ -2,6 +2,7 @@ import logging
 import os
 import random
 
+import joblib
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, ConcatDataset
@@ -97,11 +98,11 @@ def model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
 
 if __name__ == '__main__':
     ##设置超参数
-    training_epochs = 10000
+    training_epochs = 1000
     learning_rate = 1e-4
-    batch_size = 16
+    batch_size = 240
     # Save_Name = 'ACRLSD_2D(hemi+fib25+cremi)'
-    Save_Name = 'ACRLSD_2D(hemi+fib25)'
+    Save_Name = 'ACRLSD_2D(fib25)_new'
 
     set_seed()
 
@@ -113,44 +114,54 @@ if __name__ == '__main__':
     model = ACRLSD()
 
     ##单卡
-    model = model.to(device)
+    # model = model.to(device)
 
-    # ##多卡训练
-    # gpus = [0,1]#选中显卡
-    # torch.cuda.set_device('cuda:{}'.format(gpus[0]))
-    # model = nn.DataParallel(model.cuda(), device_ids=gpus, output_device=gpus[0])
-    # Save_Name = 'ACRLSD_2D(hemi+fib25+cremi)_multigpu'
+    ##多卡训练
+    gpus = [0,2]#选中显卡
+    torch.cuda.set_device('cuda:{}'.format(gpus[0]))
+    model = torch.nn.DataParallel(model.cuda(), device_ids=gpus, output_device=gpus[0])
+    Save_Name = 'ACRLSD_2D(fib25)_multigpu'
 
     ##装载数据
-    train_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/funke/hemi/training/', split='train', crop_size=128,
-                                            require_lsd=True, require_xz_yz=True)
-    val_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/funke/hemi/training/', split='val', crop_size=128,
-                                          require_lsd=True, require_xz_yz=True)
+    # train_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/hemi/training/', split='train', crop_size=128,
+    #                                         require_lsd=True, require_xz_yz=True)
+    # val_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/hemi/training/', split='val', crop_size=128,
+    #                                       require_lsd=True, require_xz_yz=True)
 
-    train_dataset_2 = Dataset_2D_fib25_Train(data_dir='./data/funke/fib25/training/', split='train', crop_size=128,
-                                             require_lsd=True, require_xz_yz=True)
-    val_dataset_2 = Dataset_2D_fib25_Train(data_dir='./data/funke/fib25/training/', split='val', crop_size=128,
-                                           require_lsd=True, require_xz_yz=True)
+    fib25_data = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/fib25'
+    if os.path.exists(os.path.join(fib25_data, 'fib25_train.joblib')):
+        print("Load data from disk...")
+        train_dataset_2 = joblib.load(os.path.join(fib25_data, 'fib25_train.joblib'))
+        val_dataset_2 = joblib.load(os.path.join(fib25_data, 'fib25_val.joblib'))
+    else:
+        train_dataset_2 = Dataset_2D_fib25_Train(data_dir=os.path.join(fib25_data, 'training'), split='train', crop_size=128,
+                                                 require_lsd=True, require_xz_yz=True)
+        joblib.dump(train_dataset_2, os.path.join(fib25_data, 'fib25_train.joblib'))
+        val_dataset_2 = Dataset_2D_fib25_Train(data_dir=os.path.join(fib25_data, 'training'), split='val', crop_size=128,
+                                               require_lsd=True, require_xz_yz=True)
+        joblib.dump(val_dataset_2, os.path.join(fib25_data, 'fib25_val.joblib'))
 
     # train_dataset_3 = Dataset_2D_cremi_Train(data_dir='../data/CREMI/', split='train', crop_size=128, require_lsd=True)
     # val_dataset_3 = Dataset_2D_cremi_Train(data_dir='../data/CREMI/', split='val', crop_size=128, require_lsd=True)
 
-    train_dataset = ConcatDataset([train_dataset_1, train_dataset_2])
-    val_dataset = ConcatDataset([val_dataset_1, val_dataset_2])
+    # train_dataset = ConcatDataset([train_dataset_1, train_dataset_2])
+    # val_dataset = ConcatDataset([val_dataset_1, val_dataset_2])
+    train_dataset = train_dataset_2
+    val_dataset = val_dataset_2
 
     # train_dataset = train_dataset_1
     # val_dataset = val_dataset_1
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=14, pin_memory=True,
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=48, pin_memory=True,
                               drop_last=True, collate_fn=collate_fn_2D_hemi_Train)
-    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=14, pin_memory=True,
+    val_loader = DataLoader(val_dataset, batch_size=batch_size // 2, shuffle=False, num_workers=48, pin_memory=True,
                             collate_fn=collate_fn_2D_hemi_Train)
 
     ##创建log日志
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    logfile = './output/log/log_{}.txt'.format(Save_Name)
-    fh = logging.FileHandler(logfile, mode='a')
+    logfile = '/home/liuhongyu2024/Downloads/UniSPAC-edited/output/log/log_{}.txt'.format(Save_Name)
+    fh = logging.FileHandler(logfile, mode='a', delay=False)
     fh.setLevel(logging.DEBUG)
     ch = logging.StreamHandler()
     ch.setLevel(logging.WARNING)
@@ -187,6 +198,7 @@ if __name__ == '__main__':
     no_improve_count = 0
     with tqdm(total=training_epochs) as pbar:
         while epoch < training_epochs:
+            pbar.set_description(f"Best epoch: {epoch}, loss: {Best_val_loss:.2f}")
             ###################Train###################
             model.train()
             # reset data loader to get random augmentations
@@ -229,7 +241,7 @@ if __name__ == '__main__':
             if Best_val_loss > val_loss:
                 Best_val_loss = val_loss
                 Best_epoch = epoch
-                torch.save(model.state_dict(), './output/checkpoints/{}_Best_in_val.model'.format(Save_Name))
+                torch.save(model.state_dict(), '/home/liuhongyu2024/Downloads/UniSPAC-edited/output/checkpoints/{}_Best_in_val.model'.format(Save_Name))
                 no_improve_count = 0
             else:
                 no_improve_count = no_improve_count + 1
@@ -237,6 +249,8 @@ if __name__ == '__main__':
             ##Record
             logging.info("Epoch {}: val_loss = {:.6f},with best val_loss = {:.6f} in epoch {}".format(
                 epoch, val_loss, Best_val_loss, Best_epoch))
+            fh.flush()
+            ch.flush()
             # writer.add_scalar('val_loss', val_loss, epoch)
 
             ##Early stop

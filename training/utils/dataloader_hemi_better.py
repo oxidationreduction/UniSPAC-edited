@@ -1,3 +1,5 @@
+import os.path
+
 import numpy as np
 import random
 from torch.utils.data import DataLoader
@@ -46,7 +48,7 @@ class Dataset_2D_hemi_Train(Dataset):
         
         
         for data_name in data_list:
-            zarr_path = data_dir + data_name
+            zarr_path = os.path.abspath(data_dir + data_name)
             f = zarr.open(zarr_path, mode='r')
             volumes = f['volumes']
             raw = volumes['raw'] #zyx
