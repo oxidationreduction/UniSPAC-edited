@@ -1,0 +1,53 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools", "wheel"]
+
+[project]
+name = "funlib.persistence"
+description = "Interfaces for data (arrays and graphs) and storage formats (databases and file formats)"
+license = { text = "MIT" }
+readme = "README.md"
+authors = [
+    { name = "William Patton", email = "pattonw@hhmi.org" },
+    { name = "Jan Funke", email = "funkej@hhmi.org" },
+]
+dynamic = ['version']
+
+requires-python = ">=3.9"
+classifiers = ["Programming Language :: Python :: 3"]
+keywords = []
+
+dependencies = [
+    "funlib.geometry",
+    "networkx",
+    "zarr>=2,<3",
+    "pymongo",
+    "numpy",
+    "h5py",
+    "psycopg2-binary",
+    "fsspec",
+    "toml",
+    "dask",
+    "pydantic",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "funlib.persistence.__version__" }
+
+[project.optional-dependencies]
+dev = [
+    'coverage>=5.0.3',
+    'pytest',
+    'pytest-mock',
+    'black',
+    'mypy',
+    'types-psycopg2',
+    'types-toml',
+]
+
+[tool.ruff]
+# pyflakes, pycodestyle, isort
+lint.select = ["F", "W", "I001"]
+
+[tool.setuptools.package-data]
+"funlib.persistence" = ["py.typed"]

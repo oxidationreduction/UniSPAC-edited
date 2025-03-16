@@ -1,0 +1,17 @@
+*.sw[pmno]
+*.hdf
+*.h5
+*.ipynb_checkpoints
+*.db
+*.py[cod]
+*.c
+*.cpp
+*.so
+*egg-info
+build
+docker/lsd
+docker/requirements.txt
+docker/setup.py
+singularity/lsd
+singularity/requirements.txt
+singularity/setup.py

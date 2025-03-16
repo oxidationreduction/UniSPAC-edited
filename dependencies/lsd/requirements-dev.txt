@@ -1,0 +1,5 @@
+mahotas
+matplotlib
+zarr
+luigi
+pytest
