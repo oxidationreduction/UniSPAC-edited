@@ -1,4 +1,6 @@
 import math
+
+import joblib
 import numpy as np
 import os
 import random
@@ -108,9 +110,9 @@ if __name__ == '__main__':
     ##设置超参数
     training_epochs = 10000
     learning_rate = 1e-4
-    batch_size = 8
+    batch_size = 120
     # Save_Name = 'ACRLSD_3D(hemi+fib25+cremi)'
-    Save_Name = 'ACRLSD_3D(hemi+fib25)'
+    Save_Name = 'ACRLSD_3D(fib25)'
 
     set_seed()
 
@@ -122,40 +124,58 @@ if __name__ == '__main__':
     model = ACRLSD_3d()
     
     ##单卡
-    model = model.to(device)
+    # model = model.to(device)
     
-    # ##多卡训练
-    # ##一机多卡设置
-    # gpus = [0,1]#选中显卡
-    # torch.cuda.set_device('cuda:{}'.format(gpus[0]))
-    # model = nn.DataParallel(model.cuda(), device_ids=gpus, output_device=gpus[0])
-    # Save_Name = 'ACRLSD_3D(hemi+fib25+cremi)_multigpu'
+    ##多卡训练
+    ##一机多卡设置
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2'
+    gpus = [0,1,2]#选中显卡
+    torch.cuda.set_device('cuda:{}'.format(gpus[0]))
+    model = nn.DataParallel(model.cuda(), device_ids=gpus, output_device=gpus[0])
+    Save_Name = 'ACRLSD_3D(fib25)'
 
 
     ##装载数据
-    train_dataset_1 = Dataset_3D_hemi_Train(data_dir='./data/funke/hemi/training/', split='train', crop_size=128, num_slices=8, require_lsd=True,require_xz_yz=True)
-    val_dataset_1 = Dataset_3D_hemi_Train(data_dir='./data/funke/hemi/training/', split='val', crop_size=128, num_slices=8, require_lsd=True,require_xz_yz=True)
-    
-    train_dataset_2 = Dataset_3D_fib25_Train(data_dir='./data/funke/fib25/training/', split='train', crop_size=128, num_slices=8, require_lsd=True,require_xz_yz=True)
-    val_dataset_2 = Dataset_3D_fib25_Train(data_dir='./data/funke/fib25/training/', split='val', crop_size=128, num_slices=8, require_lsd=True,require_xz_yz=True)
-    
+    # train_dataset_1 = Dataset_3D_hemi_Train(data_dir='./data/funke/hemi/training/', split='train', crop_size=128, num_slices=8, require_lsd=True,require_xz_yz=True)
+    # val_dataset_1 = Dataset_3D_hemi_Train(data_dir='./data/funke/hemi/training/', split='val', crop_size=128, num_slices=8, require_lsd=True,require_xz_yz=True)
+    #
+    # train_dataset_2 = Dataset_3D_fib25_Train(data_dir='./data/funke/fib25/training/', split='train', crop_size=128, num_slices=8, require_lsd=True,require_xz_yz=True)
+    # val_dataset_2 = Dataset_3D_fib25_Train(data_dir='./data/funke/fib25/training/', split='val', crop_size=128, num_slices=8, require_lsd=True,require_xz_yz=True)
+
+    fib25_data = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/fib25'
+    if os.path.exists(os.path.join(fib25_data, 'fib25_3d_train.joblib')):
+        print("Load data from disk...")
+        train_dataset_2 = joblib.load(os.path.join(fib25_data, 'fib25_3d_train.joblib'))
+        val_dataset_2 = joblib.load(os.path.join(fib25_data, 'fib25_3d_val.joblib'))
+    else:
+        train_dataset_2 = Dataset_3D_fib25_Train(data_dir='./data/fib25/training/', split='train', crop_size=128,
+                                                 num_slices=8, require_lsd=True,
+                                                 require_xz_yz=True)
+        val_dataset_2 = Dataset_3D_fib25_Train(data_dir='./data/fib25/training/', split='val', crop_size=128,
+                                               num_slices=8, require_lsd=True,
+                                               require_xz_yz=True)
+        joblib.dump(train_dataset_2, os.path.join(fib25_data, 'fib25_3d_train.joblib'))
+        joblib.dump(val_dataset_2, os.path.join(fib25_data, 'fib25_3d_val.joblib'))
+
     # train_dataset_3 = Dataset_3D_cremi_Train(data_dir='../data/CREMI/', split='train', crop_size=128, num_slices=8, require_lsd=True)
     # val_dataset_3 = Dataset_3D_cremi_Train(data_dir='../data/CREMI/', split='val', crop_size=128, num_slices=8, require_lsd=True)
     
-    train_dataset = ConcatDataset([train_dataset_1, train_dataset_2])
-    val_dataset   = ConcatDataset([val_dataset_1, val_dataset_2])
+    # train_dataset = ConcatDataset([train_dataset_1, train_dataset_2])
+    # val_dataset   = ConcatDataset([val_dataset_1, val_dataset_2])
     
-    # train_dataset = train_dataset_1
-    # val_dataset = val_dataset_1
+    train_dataset = train_dataset_2
+    val_dataset = val_dataset_2
     
-    train_loader = DataLoader(train_dataset,batch_size=batch_size, shuffle=True,num_workers=14,pin_memory=True,drop_last=True,collate_fn=collate_fn_3D_hemi_Train)
-    val_loader = DataLoader(val_dataset,batch_size=8, shuffle=False,num_workers=14,pin_memory=True,collate_fn=collate_fn_3D_hemi_Train)
+    train_loader = DataLoader(train_dataset,batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True,
+                              drop_last=True,collate_fn=collate_fn_3D_hemi_Train)
+    val_loader = DataLoader(val_dataset,batch_size=batch_size//2, shuffle=False, num_workers=8, pin_memory=True,
+                            collate_fn=collate_fn_3D_hemi_Train)
 
     ##创建log日志
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     logfile = './output/log/log_{}.txt'.format(Save_Name)
-    fh = logging.FileHandler(logfile,mode='a')
+    fh = logging.FileHandler(logfile, mode='a', delay=False)
     fh.setLevel(logging.DEBUG)
     ch = logging.StreamHandler()
     ch.setLevel(logging.WARNING)
@@ -193,13 +213,14 @@ if __name__ == '__main__':
     no_improve_count = 0
     with tqdm(total=training_epochs) as pbar:
         while epoch < training_epochs:
+            pbar.set_description(f"Best epoch: {Best_epoch}, loss: {Best_val_loss:.2f}")
             ###################Train###################
             model.train()
             # reset data loader to get random augmentations
             np.random.seed()
             random.seed()
             tmp_loader = iter(train_loader)
-            for raw, labels, mask_3D, gt_affinity, point_map,gt_lsds in tmp_loader:
+            for raw, labels, mask_3D, gt_affinity, point_map,gt_lsds in tqdm(tmp_loader, leave=False):
                 ##Get Tensor
                 raw = torch.as_tensor(raw,dtype=torch.float, device= device) #(batch, 1, height, width)
                 gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device) #(batch, 6, height, width)
@@ -232,7 +253,7 @@ if __name__ == '__main__':
             if Best_val_loss > val_loss:
                 Best_val_loss = val_loss
                 Best_epoch = epoch
-                torch.save(model.state_dict(),'./output/checkpoints/{}_Best_in_val.model'.format(Save_Name))
+                torch.save(model.module.state_dict(),'./output/checkpoints/{}_Best_in_val.model'.format(Save_Name))
                 no_improve_count = 0
             else:
                 no_improve_count = no_improve_count + 1

@@ -18,7 +18,7 @@ from utils.dataloader_fib25_better import Dataset_3D_fib25_Train,collate_fn_3D_f
 
 ## CUDA_VISIBLE_DEVICES=0 python main_segEM_3d_train_zebrafinch.py &
 
-# WEIGHT_LOSS3 = 10
+WEIGHT_LOSS3 = 10
 
 
 
@@ -254,10 +254,10 @@ def model_step(model, optimizer, input_image, input_prompt, gt_binary_mask, gt_a
     Diceloss_fn = DiceLoss().to(device)
     loss2 = Diceloss_fn(1-y_mask.squeeze(), 1-gt_binary_mask.squeeze())
     
-    # loss3 = torch.sum(y_mask * gt_affinity)/torch.sum(gt_affinity)
+    loss3 = torch.sum(y_mask * gt_affinity)/torch.sum(gt_affinity)
     
-    # loss = loss1 + loss2 + loss3 * WEIGHT_LOSS3
-    loss = loss1 + loss2
+    loss = loss1 + loss2 + loss3 * WEIGHT_LOSS3
+    # loss = loss1 + loss2
     
     # backward if training mode
     if train_step:

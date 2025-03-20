@@ -257,7 +257,7 @@ if __name__ == '__main__':
     no_improve_count = 0
     with tqdm(total=training_epochs) as pbar:
         while epoch < training_epochs:
-            pbar.set_description(f"Best epoch: {epoch}, loss: {Best_val_loss:.2f}")
+            pbar.set_description(f"Best epoch: {Best_epoch}, loss: {Best_val_loss:.2f}")
             ###################Train###################
             model.train()
             # reset data loader to get random augmentations
@@ -265,7 +265,7 @@ if __name__ == '__main__':
             random.seed()
             tmp_loader = iter(train_loader)
             # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_loader:
-            for raw, labels, point_map, mask, gt_affinity in tmp_loader:
+            for raw, labels, point_map, mask, gt_affinity in tqdm(tmp_loader, leave=True):
                 ##Get Tensor
                 raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
                 point_map = torch.as_tensor(point_map, dtype=torch.float, device=device)  # (batch, height, width)
