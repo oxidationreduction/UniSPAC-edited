@@ -15,7 +15,7 @@ from copy import deepcopy
 from models.unet2d import UNet2d
 from models.unet3d import UNet3d
 from utils.dataloader_hemi_better import Dataset_3D_hemi_Train,collate_fn_3D_hemi_Train
-from utils.dataloader_fib25_better import Dataset_3D_fib25_Train,collate_fn_3D_fib25_Train
+from utils.dataloader_ninanjie import Dataset_3D_fib25_Train,collate_fn_3D_fib25_Train
 # from utils.dataloader_cremi import Dataset_3D_cremi_Train,collate_fn_3D_cremi_Train
 
 ## CUDA_VISIBLE_DEVICES=0 python main_segEM_3d_train_zebrafinch.py &

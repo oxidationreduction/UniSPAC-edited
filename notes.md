@@ -1,3 +1,5 @@
+# UniSPAC 结构、数据流和实现细节
+
 ## UniSPAC-2D
 
 ### 模型结构
@@ -73,7 +75,7 @@ LSDs 预测：3D-UNet，1 通道输入，10 通道输出。
 2. `lsd_predict(x)` -> `y_lsds`（10 通道）
 3. `affinity_predict([x, y_lsds])` -> `y_affinity`（3 通道）
 
-### 两种模型版本
+### 两种训练版本
 
 普通版：输入只有原图和 prompt，利用原图和 prompt 生成第一层的 mask 并替换生成x_raw_new，需要 2D 模型协作。
 

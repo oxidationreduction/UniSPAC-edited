@@ -2,7 +2,8 @@ from collections import OrderedDict
 import torch
 
 # 加载权重文件
-state_dict = torch.load('ACRLSD_2D(fib25)_multigpu_Best_in_val.model')
+file_name = 'ACRLSD_2D(ninanjie)_multigpu-no-xz-yz_no-crop_Best_in_val0.model'
+state_dict = torch.load(file_name)
 
 # 去掉 'module.' 前缀
 new_state_dict = OrderedDict()
@@ -10,7 +11,7 @@ for k, v in state_dict.items():
     name = k[7:]  # 去掉 'module.' 前缀
     new_state_dict[name] = v
 
-torch.save(new_state_dict, 'ACRLSD_2D(fib25)_Best_in_val.model')
+torch.save(new_state_dict, file_name)
 
 
 

@@ -85,7 +85,7 @@ class segEM_2d(torch.nn.Module):
         self.model_affinity = ACRLSD()
         # model_path = './output/checkpoints/ACRLSD_2D(hemi+fib25+cremi)_Best_in_val.model' 
         model_path = './output/checkpoints/ACRLSD_2D(hemi+fib25)_Best_in_val.model' 
-        weights = torch.load(model_path,map_location=torch.device('cpu'))
+        weights = torch.load(model_path, map_location=torch.device('cpu'))
         self.model_affinity.load_state_dict(weights)
         for param in self.model_affinity.parameters():
             param.requires_grad = False

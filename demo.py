@@ -384,7 +384,7 @@ class ImageViewer(QMainWindow):
                 self.affinityPixmap.scaled(self.seg_show.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def track(self):
-        ##Load image
+        ## Load image
         self.raw_3d = np.zeros((self.crop_size, self.crop_size, self.slices_tracking), dtype=np.float32)
         # for idx in range(self.slices_tracking):
         if (self.image_idx + self.slices_tracking) >= self.raw.shape[0]:

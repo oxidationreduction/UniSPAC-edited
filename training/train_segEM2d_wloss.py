@@ -12,7 +12,7 @@ from tqdm.auto import tqdm
 
 # from torch.utils.tensorboard import SummaryWriter
 from models.unet2d import UNet2d
-from utils.dataloader_fib25_better import Dataset_2D_fib25_Train
+from utils.dataloader_ninanjie import Dataset_2D_fib25_Train
 from utils.dataloader_hemi_better import Dataset_2D_hemi_Train, collate_fn_2D_hemi_Train
 
 ## CUDA_VISIBLE_DEVICES=0 python main_segEM_2d_train_zebrafinch.py &

@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+from collections import OrderedDict
 
 import joblib
 import numpy as np
@@ -10,7 +11,8 @@ from tqdm.auto import tqdm
 
 # from torch.utils.tensorboard import SummaryWriter
 from models.unet2d import UNet2d
-from utils.dataloader_fib25_better import Dataset_2D_fib25_Train
+from training.utils.dataloader_ninanjie import Dataset_2D_ninanjie_Train, load_dataset, collate_fn_2D_fib25_Train
+from utils.dataloader_ninanjie import Dataset_2D_ninanjie_Train
 from utils.dataloader_hemi_better import Dataset_2D_hemi_Train, collate_fn_2D_hemi_Train
 
 
@@ -96,13 +98,19 @@ def model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
     return loss_value, outputs
 
 
+def remove_module(state_dict):
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = k[7:]  if k[:7] == 'module.' else k # 去掉 'module.' 前缀
+        new_state_dict[name] = v
+    return new_state_dict
+
+
 if __name__ == '__main__':
     ##设置超参数
     training_epochs = 1000
     learning_rate = 1e-4
-    batch_size = 8
-    # Save_Name = 'ACRLSD_2D(hemi+fib25+cremi)'
-    Save_Name = 'ACRLSD_2D(ninanjie)'
+    batch_size = 12
 
     set_seed()
 
@@ -117,10 +125,10 @@ if __name__ == '__main__':
     # model = model.to(device)
 
     ##多卡训练
-    gpus = [0,2]#选中显卡
+    gpus = [0,1]#选中显卡
     torch.cuda.set_device('cuda:{}'.format(gpus[0]))
     model = torch.nn.DataParallel(model.cuda(), device_ids=gpus, output_device=gpus[0])
-    Save_Name = 'ACRLSD_2D(ninanjie)_multigpu'
+    Save_Name = 'ACRLSD_2D(ninanjie)_multigpu-no-xz-yz_no-crop'
 
     ##装载数据
     # train_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/hemi/training/', split='train', crop_size=128,
@@ -128,18 +136,10 @@ if __name__ == '__main__':
     # val_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/hemi/training/', split='val', crop_size=128,
     #                                       require_lsd=True, require_xz_yz=True)
 
-    fib25_data = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/fib25'
-    if os.path.exists(os.path.join(fib25_data, 'fib25_train.joblib')):
-        print("Load data from disk...")
-        train_dataset_2 = joblib.load(os.path.join(fib25_data, 'fib25_train.joblib'))
-        val_dataset_2 = joblib.load(os.path.join(fib25_data, 'fib25_val.joblib'))
-    else:
-        train_dataset_2 = Dataset_2D_fib25_Train(data_dir=os.path.join(fib25_data, 'training'), split='train', crop_size=128,
-                                                 require_lsd=True, require_xz_yz=True)
-        joblib.dump(train_dataset_2, os.path.join(fib25_data, 'fib25_train.joblib'))
-        val_dataset_2 = Dataset_2D_fib25_Train(data_dir=os.path.join(fib25_data, 'training'), split='val', crop_size=128,
-                                               require_lsd=True, require_xz_yz=True)
-        joblib.dump(val_dataset_2, os.path.join(fib25_data, 'fib25_val.joblib'))
+    ninanjie_data = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie'
+    ninanjie_save = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie-save'
+    train_dataset_2 = load_dataset('ninanjie_train.joblib', 'train', require_xz_yz=False, from_temp=True)
+    val_dataset_2 = load_dataset('ninanjie_val.joblib', 'val', require_xz_yz=False, from_temp=True)
 
     # train_dataset_3 = Dataset_2D_cremi_Train(data_dir='../data/CREMI/', split='train', crop_size=128, require_lsd=True)
     # val_dataset_3 = Dataset_2D_cremi_Train(data_dir='../data/CREMI/', split='val', crop_size=128, require_lsd=True)
@@ -153,9 +153,20 @@ if __name__ == '__main__':
     # val_dataset = val_dataset_1
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=48, pin_memory=True,
-                              drop_last=True, collate_fn=collate_fn_2D_hemi_Train)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size // 2, shuffle=False, num_workers=48, pin_memory=True,
-                            collate_fn=collate_fn_2D_hemi_Train)
+                              drop_last=True, collate_fn=collate_fn_2D_fib25_Train)
+    val_loader = DataLoader(val_dataset, batch_size=(batch_size // 2) + 1, shuffle=False, num_workers=48, pin_memory=True,
+                            collate_fn=collate_fn_2D_fib25_Train)
+
+    def load_data_to_device(loader):
+        res = []
+        for raw, labels, point_map, mask, gt_affinity, gt_lsds in loader:
+            raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
+            gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
+            gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
+                                          device=device)  # (batch, 2, height, width)
+            res.append((raw, labels, point_map, mask, gt_affinity, gt_lsds))
+        return res
+    train_loader, val_loader = load_data_to_device(train_loader), load_data_to_device(val_loader)
 
     ##创建log日志
     logger = logging.getLogger()
@@ -198,22 +209,23 @@ if __name__ == '__main__':
     no_improve_count = 0
     with tqdm(total=training_epochs) as pbar:
         while epoch < training_epochs:
-            pbar.set_description(f"Best epoch: {epoch}, loss: {Best_val_loss:.2f}")
             ###################Train###################
             model.train()
             # reset data loader to get random augmentations
             np.random.seed()
             random.seed()
-            tmp_loader = iter(train_loader)
+            count, total = 0, len(train_loader)
             # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_loader:
-            for raw, labels, point_map, mask, gt_affinity, gt_lsds in tmp_loader:
+            for raw, labels, point_map, mask, gt_affinity, gt_lsds in train_loader:
                 ##Get Tensor
-                raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
-                gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
-                gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
-                                              device=device)  # (batch, 2, height, width)
+                # raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
+                # gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
+                # gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
+                #                               device=device)  # (batch, 2, height, width)
 
                 loss_value, pred = model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation)
+                pbar.set_description(f"Train {count}/{total}, Best: {epoch}, loss: {Best_val_loss:.2f}")
+                count += 1
             epoch += 1
             pbar.update(1)
 
@@ -223,30 +235,33 @@ if __name__ == '__main__':
             seed = 98
             np.random.seed(seed)
             random.seed(seed)
-            tmp_val_loader = iter(val_loader)
             acc_loss = []
+            count, total = 0, len(val_loader)
             # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_val_loader:
-            for raw, labels, point_map, mask, gt_affinity, gt_lsds in tmp_val_loader:
-                raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
-                gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
-                gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
-                                              device=device)  # (batch, 2, height, width)
+            for raw, labels, point_map, mask, gt_affinity, gt_lsds in val_loader:
+                # raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
+                # gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
+                # gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
+                #                               device=device)  # (batch, 2, height, width)
                 with torch.no_grad():
                     loss_value, _ = model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
                                                train_step=False)
-                acc_loss.append(loss_value.cpu().detach().numpy())
-            val_loss = np.mean(acc_loss)
+                acc_loss.append(loss_value)
+                pbar.set_description(f"Val {count}/{total}, Best: {epoch}, loss: {Best_val_loss:.4f}")
+                count += 1
+            val_loss = np.mean(np.array(loss_value.cpu().numpy() for loss_value in acc_loss))
 
             ###################Compare###################
             if Best_val_loss > val_loss:
                 Best_val_loss = val_loss
                 Best_epoch = epoch
-                torch.save(model.state_dict(), '/home/liuhongyu2024/Downloads/UniSPAC-edited/output/checkpoints/{}_Best_in_val.model'.format(Save_Name))
+
+                torch.save(model.state_dict(), './output/checkpoints/{}_Best_in_val.model'.format(Save_Name))
                 no_improve_count = 0
             else:
-                no_improve_count = no_improve_count + 1
+                no_improve_count += 1
 
-            ##Record
+            ## Record
             logging.info("Epoch {}: val_loss = {:.6f},with best val_loss = {:.6f} in epoch {}".format(
                 epoch, val_loss, Best_val_loss, Best_epoch))
             fh.flush()
@@ -254,6 +269,6 @@ if __name__ == '__main__':
             # writer.add_scalar('val_loss', val_loss, epoch)
 
             ##Early stop
-            if no_improve_count == early_stop_count:
+            if no_improve_count == early_stop_count and epoch > 100:
                 logging.info("Early stop!")
                 break

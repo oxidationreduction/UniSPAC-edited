@@ -1,9 +1,14 @@
+from multiprocessing.pool import Pool
 import os.path
 import random
+from time import sleep
 
 import albumentations as A  ##一种数据增强库
+import joblib
 import numpy as np
+import tqdm
 import zarr
+from PIL import Image
 from lsd.train import local_shape_descriptor
 from scipy.ndimage import binary_erosion
 # import matplotlib.pyplot as plt
@@ -11,18 +16,33 @@ from scipy.stats import multivariate_normal
 # import h5py
 from skimage.measure import label
 from torch.utils.data import Dataset
-import tqdm
 
 
-class Dataset_2D_fib25_Train(Dataset):
+ninanjie_data = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie'
+ninanjie_save = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie-save'
+
+def load_dataset(dataset_name: str, split: str='train', from_temp=True, require_lsd=True, require_xz_yz=True):
+    temp_name = f'{dataset_name}_{from_temp}_{require_lsd}_{require_xz_yz}'
+    DATASET = Dataset_3D_ninanjie_Train if '3d' in dataset_name.lower() else Dataset_2D_ninanjie_Train
+    if os.path.exists(os.path.join(ninanjie_save, temp_name)) and from_temp:
+        print(f"Load {dataset_name} from disk...")
+        train_dataset = joblib.load(os.path.join(ninanjie_save, temp_name))
+    else:
+        train_dataset = DATASET(data_dir=os.path.join(ninanjie_data), split=split, crop_size=256,
+                                                  require_lsd=require_lsd, require_xz_yz=require_xz_yz)
+        joblib.dump(train_dataset, os.path.join(ninanjie_save, temp_name))
+    return train_dataset
+
+
+class Dataset_2D_ninanjie_Train(Dataset):
     def __init__(
             self,
-            data_dir='./data/fib25/training/',  # 数据的路径
+            data_dir='./data/ninanjie',  # 数据的路径
             split='train',  # 划分方式
             crop_size=None,  # 切割尺寸
             padding_size=8,
             require_lsd=False,
-            require_xz_yz=False, ):
+            require_xz_yz=False):
 
         self.split = split
         self.crop_size = crop_size
@@ -30,56 +50,91 @@ class Dataset_2D_fib25_Train(Dataset):
         self.split = split
         self.require_lsd = require_lsd
 
-        ###装载FIB-25的训练数据
         self.images = list()
         self.masks = list()
-        ##装载数据
-        data_list = ['trvol-250-1.zarr', 'trvol-250-2.zarr', 'tstvol-520-1.zarr', 'tstvol-520-2.zarr']
-        # data_list = data_list * 8
+
+        data_list = ['first', 'fourth']
+        data_list = data_list * 8
 
         # ##Debug
-        data_list = ['trvol-250-1.zarr']
+        # data_list = ['trvol-250-1.zarr']
 
-        for data_name in data_list:
-            zarr_path = os.path.join(data_dir, data_name)
-            f = zarr.open(zarr_path, mode='r')
-            volumes = f['volumes']
-            raw = volumes['raw']  # zyx
-            labels = volumes['labels']['neuron_ids']  # zyx
+        raw, labels = list(), list()
+        for data in data_list:
+            raw_dir = os.path.join(data_dir, data, 'raw')
+            labels_dir = os.path.join(data_dir, data, 'labels')
 
-            labels = label(labels).astype(np.uint16)  # 读取通道0的标签信息，并设置好连通域
+            for image in os.listdir(raw_dir):
+                # read image from disk, tiff
+                raw_img = Image.open(os.path.join(raw_dir, image))
+                raw.append(raw_img)
+                label_img = Image.open(os.path.join(labels_dir, image))
+                labels.append(label_img)
+        raw = np.array(raw)
+        labels = np.array(labels).astype(np.uint16)
 
-            print('data {}: raw shape={}, label shape = {}'.format(data_name, raw.shape, labels.shape))
+        raw_crop = []
+        labels_crop = []
+        lines, rows = (1, 1)
+        cropped_size = (raw.shape[1] // lines, raw.shape[2] // rows)
+        for line in range(lines):
+            for row in range(rows):
+                for raw_, labels_ in zip(raw, labels):
+                    raw_crop.append(raw_[line * cropped_size[0]:(line + 1) * cropped_size[0], row * cropped_size[1]:(row + 1) * cropped_size[1]])
+                    labels_crop.append(labels_[line * cropped_size[0]:(line + 1) * cropped_size[0], row * cropped_size[1]:(row + 1) * cropped_size[1]])
+        raw = np.array(raw_crop)
+        labels = label(np.array(labels_crop)).astype(np.uint16)
 
-            assert len(raw) == len(labels)
+        print('raw shape={}, label shape = {}'.format(raw.shape, labels.shape))
+
+        val_size = 8 # if len(raw) > 40 else max(2, len(raw) // 5)
+
+        if split == 'train':
+            self.images.extend(raw[val_size:])
+            self.masks.extend(labels[val_size:])
+        elif split == 'val':
+            self.images.extend(raw[:val_size])
+            self.masks.extend(labels[:val_size])
+
+        if require_xz_yz:
             if split == 'train':
-                self.images.extend(raw[8:])
-                self.masks.extend(labels[8:])
+                for n in range(val_size, raw.shape[1]):
+                    self.images.append(raw[:, n, :])
+                    self.masks.append(labels[:, n, :])
+                for n in range(val_size, labels.shape[2]):
+                    self.images.append(raw[:, :, n])
+                    self.masks.append(labels[:, :, n])
             elif split == 'val':
-                self.images.extend(raw[:8])
-                self.masks.extend(labels[:8])
+                for n in range(val_size):
+                    self.images.append(raw[:, n, :])
+                    self.masks.append(labels[:, n, :])
+                    self.images.append(raw[:, :, n])
+                    self.masks.append(labels[:, :, n])
 
-            if require_xz_yz:
-                if split == 'train':
-                    for n in range(8, labels.shape[1]):
-                        self.images.append(raw[:, n, :])
-                        self.masks.append(labels[:, n, :])
-                    for n in range(8, labels.shape[2]):
-                        self.images.append(raw[:, :, n])
-                        self.masks.append(labels[:, :, n])
-                elif split == 'val':
-                    for n in range(8):
-                        self.images.append(raw[:, n, :])
-                        self.masks.append(labels[:, n, :])
-                        self.images.append(raw[:, :, n])
-                        self.masks.append(labels[:, :, n])
+        self.data_pack = []
+        for idx in tqdm.tqdm(range(len(self.images))):
+            sub_data = self.prework(idx)
+            if sub_data is not None:
+                self.data_pack.append(sub_data)
+            else:
+                print(f"data index={idx} is invalid.")
+                # sleep(1)
 
+        # pool = Pool(8)
+        # results = []
+        # pbar = tqdm.tqdm(total=len(self.images))
+        # for idx in range(len(self.images)):
+        #     results.append(pool.apply_async(self.prework, args=(idx,pbar)))
+        # pool.close()
+        # pool.join()
         # self.data_pack = []
-        # for idx in tqdm(range(len(self.images))):
-        #     self.data_pack.append(self.prework(idx))
+        # for result in tqdm.tqdm(results):
+        #     self.data_pack.append(result.get())
+        # pbar.close()
+
 
     def __len__(self):
-        return len(self.images)
+        return len(self.data_pack)
 
     # function to erode label boundaries，即腐蚀边界
     def erode(self, labels, iterations, border_value):
@@ -158,7 +213,6 @@ class Dataset_2D_fib25_Train(Dataset):
         return (data - np.min(data)) / (np.max(data) - np.min(data)).astype(np.float32)
 
     def get_prompt(self, labels):
-
         ##
         Points_pos = list()
         Points_lab = list()
@@ -283,7 +337,7 @@ class Dataset_2D_fib25_Train(Dataset):
 
         return affinity
 
-    def prework(self, idx):
+    def prework(self, idx, pbar=None):
         raw = self.images[idx]  # 获得第idx张图像
         labels = self.masks[idx]  # 获得第idx张图像的标签信息
 
@@ -306,10 +360,10 @@ class Dataset_2D_fib25_Train(Dataset):
 
         # if train/val, generate our gt labels
         ## 非测试数据的话，进行一轮边界腐蚀
-        labels = self.erode(
-            labels,
-            iterations=1,  # 腐蚀的迭代次数
-            border_value=1)  # 边界值
+        # labels = self.erode(
+        #     labels,
+        #     iterations=1,  # 腐蚀的迭代次数
+        #     border_value=1)  # 边界值
 
         affinity = self.getAffinity(labels)
 
@@ -321,9 +375,16 @@ class Dataset_2D_fib25_Train(Dataset):
 
             lsds = lsds.astype(np.float32)  # 6* 图像维度
 
+        if len(np.unique(labels)) == 1:
+            if pbar is not None:
+                pbar.update()
+            return None
+
         Points_pos, Points_lab, Boxes, mask = self.get_prompt(labels)
 
         point_map = self.generate_gaussian_matrix(Points_pos, Points_lab, self.crop_size, self.crop_size, theta=30)
+        if pbar is not None:
+            pbar.update()
 
         if self.require_lsd:
             # return raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,affinity,lsds
@@ -333,7 +394,7 @@ class Dataset_2D_fib25_Train(Dataset):
             return raw, labels, point_map, mask, affinity
 
     def __getitem__(self, idx):
-        return self.prework(idx)
+        return self.data_pack[idx]
 
 
 def collate_fn_2D_fib25_Train(batch):
@@ -370,10 +431,10 @@ def collate_fn_2D_fib25_Train(batch):
     # return raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,affinity,lsds
 
 
-class Dataset_3D_fib25_Train(Dataset):
+class Dataset_3D_ninanjie_Train(Dataset):
     def __init__(
             self,
-            data_dir='./data/fib25/training/',  # 数据的路径
+            data_dir='./data/ninanjie/',  # 数据的路径
             split='train',  # 划分方式
             crop_size=None,  # 切割尺寸
             num_slices=8,
@@ -392,45 +453,98 @@ class Dataset_3D_fib25_Train(Dataset):
         self.images = list()
         self.masks = list()
         self.idxs = list()
+
         ##装载数据
-        data_list = ['trvol-250-1.zarr', 'trvol-250-2.zarr', 'tstvol-520-1.zarr', 'tstvol-520-2.zarr']
+        # data_list = ['trvol-250-1.zarr', 'trvol-250-2.zarr', 'tstvol-520-1.zarr', 'tstvol-520-2.zarr']
+        # data_list = data_list * 8
+
+        data_list = ['first', 'fourth']
         # data_list = data_list * 8
 
         # ##Debug
         # data_list = ['trvol-250-1.zarr']
 
-        for data_name in data_list:
-            zarr_path = data_dir + data_name
-            f = zarr.open(zarr_path, mode='r')
-            volumes = f['volumes']
-            raw = volumes['raw']  # zyx
-            labels = volumes['labels']['neuron_ids']  # zyx
+        for data in data_list:
+            raw_dir = os.path.join(data_dir, data, 'raw')
+            labels_dir = os.path.join(data_dir, data, 'labels')
 
-            raw = np.array(raw)
-            labels = label(labels).astype(np.uint16)  # 读取通道0的标签信息，并设置好连通域
-
-            print('data {}: raw shape={}, label shape = {}'.format(data_name, raw.shape, labels.shape))
+            raw_, labels_ = list(), list()
+            for image in os.listdir(raw_dir):
+                # read image from disk, tiff
+                raw_img = Image.open(os.path.join(raw_dir, image))
+                raw_.append(raw_img)
+                label_img = Image.open(os.path.join(labels_dir, image))
+                labels_.append(label_img)
+            raw_ = np.array(raw_)
+            labels_ = np.array(labels_)
+            print('raw shape={}, label shape={}'.format(raw_.shape, labels_.shape))
+            val_size = 8 # if len(raw_) > 40 else max(2, len(raw_) // 5)
 
             if split == 'train':
-                self.images.append(raw[8:])
-                self.masks.append(labels[8:])
+                self.images.append(raw_[val_size:])
+                self.masks.append(labels_[val_size:])
             elif split == 'val':
-                self.images.append(raw[:8])
-                self.masks.append(labels[:8])
+                self.images.append(raw_[:val_size])
+                self.masks.append(labels_[:val_size])
 
             if require_xz_yz:
                 if split == 'train':
-                    self.images.append(raw.transpose(1, 0, 2)[8:])
-                    self.masks.append(labels.transpose(1, 0, 2)[8:])
-                    self.images.append(raw.transpose(1, 2, 0)[8:])
-                    self.masks.append(labels.transpose(1, 2, 0)[8:])
+                    self.images.append(raw_.transpose(1, 0, 2)[val_size:])
+                    self.masks.append(labels_.transpose(1, 0, 2)[val_size:])
+                    self.images.append(raw_.transpose(1, 2, 0)[val_size:])
+                    self.masks.append(labels_.transpose(1, 2, 0)[val_size:])
                 elif split == 'val':
-                    self.images.append(raw.transpose(1, 0, 2)[:8])
-                    self.masks.append(labels.transpose(1, 0, 2)[:8])
-                    self.images.append(raw.transpose(1, 2, 0)[:8])
-                    self.masks.append(labels.transpose(1, 2, 0)[:8])
+                    self.images.append(raw_.transpose(1, 0, 2)[:val_size])
+                    self.masks.append(labels_.transpose(1, 0, 2)[:val_size])
+                    self.images.append(raw_.transpose(1, 2, 0)[:val_size])
+                    self.masks.append(labels_.transpose(1, 2, 0)[:val_size])
 
-        ##load all 3D patches 
+        # raw_crop = []
+        # labels_crop = []
+        # lines, rows = (1, 1)
+        # cropped_size = (raw.shape[1] // lines, raw.shape[2] // rows)
+        # for line in range(lines):
+        #     for row in range(rows):
+        #         for raw_, labels_ in zip(raw, labels):
+        #             raw_crop.append(raw_[line * cropped_size[0]:(line + 1) * cropped_size[0],
+        #                             row * cropped_size[1]:(row + 1) * cropped_size[1]])
+        #             labels_crop.append(labels_[line * cropped_size[0]:(line + 1) * cropped_size[0],
+        #                                row * cropped_size[1]:(row + 1) * cropped_size[1]])
+        # raw = np.array(raw_crop)
+        # labels = label(np.array(labels_crop)).astype(np.uint16)
+
+        # for data_name in data_list:
+        #     zarr_path = data_dir + data_name
+        #     f = zarr.open(zarr_path, mode='r')
+        #     volumes = f['volumes']
+        #     raw = volumes['raw']  # zyx
+        #     labels = volumes['labels']['neuron_ids']  # zyx
+        #
+        #     raw = np.array(raw)
+        #     labels = label(labels).astype(np.uint16)  # 读取通道0的标签信息，并设置好连通域
+        #
+        #     print('data {}: raw shape={}, label shape = {}'.format(data_name, raw.shape, labels.shape))
+        #
+        #     if split == 'train':
+        #         self.images.append(raw[8:])
+        #         self.masks.append(labels[8:])
+        #     elif split == 'val':
+        #         self.images.append(raw[:8])
+        #         self.masks.append(labels[:8])
+        #
+        #     if require_xz_yz:
+        #         if split == 'train':
+        #             self.images.append(raw.transpose(1, 0, 2)[8:])
+        #             self.masks.append(labels.transpose(1, 0, 2)[8:])
+        #             self.images.append(raw.transpose(1, 2, 0)[8:])
+        #             self.masks.append(labels.transpose(1, 2, 0)[8:])
+        #         elif split == 'val':
+        #             self.images.append(raw.transpose(1, 0, 2)[:8])
+        #             self.masks.append(labels.transpose(1, 0, 2)[:8])
+        #             self.images.append(raw.transpose(1, 2, 0)[:8])
+        #             self.masks.append(labels.transpose(1, 2, 0)[:8])
+
+        ##load all 3D patches
         for idx_img in range(len(self.images)):
             for idx_slice in range(self.images[idx_img].shape[0] - self.num_slices + 1):
                 if not np.any(self.masks[idx_img][idx_slice]):
@@ -661,9 +775,6 @@ class Dataset_3D_fib25_Train(Dataset):
 
         return total_matrix
 
-    def __getitem__(self, idx):
-        return self.data_pack[idx]
-
     def prework(self, idx):
         idx_image = self.idxs[idx][0]
         idx_slice = self.idxs[idx][1]
@@ -713,8 +824,11 @@ class Dataset_3D_fib25_Train(Dataset):
         else:
             return raw, labels, mask_3D, affinity, point_map
 
+    def __getitem__(self, idx):
+        return self.data_pack[idx]
 
-def collate_fn_3D_fib25_Train(batch):
+
+def collate_fn_3D_ninanjie_Train(batch):
     raw = np.array([item[0] for item in batch]).astype(np.float32)  # 注意normalize了，这里要用float
 
     labels = np.array([item[1] for item in batch]).astype(np.int32)
