@@ -1,26 +1,26 @@
 import logging
 import os
 import random
-import sys
+from collections import OrderedDict
 
 import joblib
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from scipy.constants import precision
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, ConcatDataset
-from torchmetrics.functional import accuracy, recall, f1_score, precision
+from torch.utils.data import DataLoader
+from torchmetrics.functional import accuracy, precision, recall, f1_score
 from tqdm.auto import tqdm
 
 # from torch.utils.tensorboard import SummaryWriter
 from models.unet2d import UNet2d
-from utils.dataloader_fib25_better import Dataset_2D_fib25_Train
+from utils.dataloader_ninanjie import Dataset_2D_ninanjie_Train, load_dataset, collate_fn_2D_fib25_Train
 from utils.dataloader_hemi_better import Dataset_2D_hemi_Train, collate_fn_2D_hemi_Train
 
 ## CUDA_VISIBLE_DEVICES=0 python main_segEM_2d_train_zebrafinch.py &
 
+WEIGHT_LOSS2 = 2
 WEIGHT_LOSS3 = 1
 
 
@@ -74,6 +74,14 @@ class ACRLSD(torch.nn.Module):
         return y_lsds, y_affinity
 
 
+def remove_module(state_dict):
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = k.replace('module.', '') # 去掉 'module.' 前缀
+        new_state_dict[name] = v
+    return new_state_dict
+
+
 ####ACRLSD模型
 class segEM2d(torch.nn.Module):
     def __init__(
@@ -83,11 +91,11 @@ class segEM2d(torch.nn.Module):
 
         ##For affinity prediction
         self.model_affinity = ACRLSD()
-        # model_path = './output/checkpoints/ACRLSD_2D(hemi+fib25+cremi)_Best_in_val.model' 
-        model_path = ('/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/checkpoints/'
-                      'ACRLSD_2D(hemi+fib25)_Best_in_val.model')
-        weights = torch.load(model_path, map_location=torch.device('cpu'))
-        self.model_affinity.load_state_dict(weights)
+        # model_path = './output/checkpoints/ACRLSD_2D(hemi+fib25+cremi)_Best_in_val.model'
+        model_path = ('/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/training/'
+                      'output/checkpoints/ACRLSD_2D(ninanjie)_origin_Best_in_val.model')
+        weights = torch.load(model_path, map_location=torch.device('cuda'))
+        self.model_affinity.load_state_dict(remove_module(weights))
         for param in self.model_affinity.parameters():
             param.requires_grad = False
 
@@ -141,7 +149,7 @@ def model_step(model, optimizer, input_image, input_prompt, gt_binary_mask, gt_a
 
     # forward
     # lsd_logits,affinity_logits = model(raw)
-    y_mask, _, _ = model(input_image, input_prompt)
+    y_mask, y_lsds, y_affinity = model(input_image, input_prompt)
 
     loss1 = F.binary_cross_entropy(y_mask.squeeze(), gt_binary_mask.squeeze())
     Diceloss_fn = DiceLoss().to(device)
@@ -150,7 +158,7 @@ def model_step(model, optimizer, input_image, input_prompt, gt_binary_mask, gt_a
     # loss = loss1 + loss2
 
     loss3 = torch.sum(y_mask * gt_affinity) / torch.sum(gt_affinity)
-    loss = loss1 + loss2 + loss3 * WEIGHT_LOSS3
+    loss = loss1 + loss2 * WEIGHT_LOSS2 + loss3 * WEIGHT_LOSS3
 
     results_ = None
 
@@ -159,69 +167,67 @@ def model_step(model, optimizer, input_image, input_prompt, gt_binary_mask, gt_a
         loss.backward()
         optimizer.step()
     else:
-        y_pred_binary, gt_binary_mask = y_mask.squeeze(), gt_binary_mask.squeeze()
+        y_mask, gt_binary_mask = y_mask.squeeze(), gt_binary_mask.squeeze()
         results_ = {
-            'accuracy': accuracy(y_pred_binary, gt_binary_mask, task='binary'),
-            'precision': precision(y_pred_binary, gt_binary_mask, task='binary'),
-            'recall': recall(y_pred_binary, gt_binary_mask, task='binary'),
-            'f1': f1_score(y_pred_binary, gt_binary_mask, task='binary')
+            'accuracy': accuracy(y_mask, gt_binary_mask, task='binary').item(),
+            'precision': precision(y_mask, gt_binary_mask, task='binary').item(),
+            'recall': recall(y_mask, gt_binary_mask, task='binary').item(),
+            'f1': f1_score(y_mask, gt_binary_mask, task='binary').item()
         }
 
     return (loss, y_mask, results_) if results_ else (loss, y_mask)
 
 
-
 if __name__ == '__main__':
     ##设置超参数
-    training_epochs = 1000
+    training_epochs = 10000
     learning_rate = 1e-4
-    batch_size = 256
-    Save_Name = 'segEM2d(fib25)wloss-{}'.format(WEIGHT_LOSS3)
+    batch_size = 128
+    Save_Name = 'segEM2d(ninanjie)-w2-{}-w3-{}'.format(WEIGHT_LOSS2, WEIGHT_LOSS3)
 
     set_seed()
 
     ###创建模型
-    # set device
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    torch.backends.cudnn.benchmark = True
 
     model = segEM2d()
     #多卡训练
     # 一机多卡设置
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1' #设置所有可以使用的显卡，共计四块
-    device_ids = [0,1] #选中显卡
-    model = nn.DataParallel(model.cuda(), device_ids=device_ids, output_device=device_ids[0])#并行使用两块
-    # model = torch.nn.DataParallel(model)  # 默认使用所有的device_ids
+    os.environ['CUDA_VISIBLE_DEVICES'] = '2' #设置所有可以使用的显卡，共计四块
+    device_ids = [int(i) for i in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]  # 选中显卡
+    # set device
+    device = torch.device(f"cuda:{device_ids[0]}" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True
 
+    model = nn.DataParallel(model.cuda(), device_ids=device_ids, output_device=device_ids[0])#并行使用两块
+    # model = torch.nn.DataParallel(model)  # 默认使用所有的 device_ids
     # model = model.to(device)
 
     ##装载数据
+    # train_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/funke/hemi/training/', split='train', crop_size=128,
+    #                                         require_lsd=False, require_xz_yz=True)
+    # val_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/funke/hemi/training/', split='val', crop_size=128,
+    #                                       require_lsd=False, require_xz_yz=True)
+    #
+    # train_dataset_2 = Dataset_2D_fib25_Train(data_dir='./data/funke/fib25/training/', split='train', crop_size=128,
+    #                                          require_lsd=False, require_xz_yz=True)
+    # val_dataset_2 = Dataset_2D_fib25_Train(data_dir='./data/funke/fib25/training/', split='val', crop_size=128,
+    #                                        require_lsd=False, require_xz_yz=True)
 
-    fib25_data = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/fib25'
-    if not os.path.exists(os.path.join(fib25_data, 'fib25_train.joblib')):
-        print("Load data from disk...")
-        train_dataset_2 = joblib.load(os.path.join(fib25_data, 'fib25_train.joblib'))
-        val_dataset_2 = joblib.load(os.path.join(fib25_data, 'fib25_val.joblib'))
-    else:
-        train_dataset_2 = Dataset_2D_fib25_Train(data_dir=os.path.join(fib25_data, 'training'), split='train',
-                                                 crop_size=128,
-                                                 require_lsd=True, require_xz_yz=False)
-        joblib.dump(train_dataset_2, os.path.join(fib25_data, 'fib25_train.joblib'))
-        val_dataset_2 = Dataset_2D_fib25_Train(data_dir=os.path.join(fib25_data, 'training'), split='val',
-                                               crop_size=128,
-                                               require_lsd=True, require_xz_yz=False)
-        joblib.dump(val_dataset_2, os.path.join(fib25_data, 'fib25_val.joblib'))
+    train_dataset_1 = load_dataset('ninanjie_train.joblib', 'train', require_xz_yz=False, from_temp=True)
+    val_dataset_1 = load_dataset('ninanjie_val.joblib', 'val', require_xz_yz=False, from_temp=True)
 
-    print(np.unique(train_dataset_2.flatten()))
-    sys.exit(0)
+    train_dataset = train_dataset_1
+    val_dataset = val_dataset_1
+    # train_dataset_3 = Dataset_2D_cremi_Train(data_dir='../data/CREMI/', split='train', crop_size=128, require_lsd=False)
+    # val_dataset_3 = Dataset_2D_cremi_Train(data_dir='../data/CREMI/', split='val', crop_size=128, require_lsd=False)
 
-    train_dataset = train_dataset_2
-    val_dataset = val_dataset_2
+    # train_dataset = ConcatDataset([train_dataset_1, train_dataset_2])
+    # val_dataset = ConcatDataset([val_dataset_1, val_dataset_2])
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=48, pin_memory=True,
-                              drop_last=True, collate_fn=collate_fn_2D_hemi_Train)
-    val_loader = DataLoader(val_dataset, batch_size=384, shuffle=False, num_workers=48, pin_memory=True,
-                            collate_fn=collate_fn_2D_hemi_Train)
+                              drop_last=True, collate_fn=collate_fn_2D_fib25_Train)
+    val_loader = DataLoader(val_dataset, batch_size=(batch_size // 2) + 1, shuffle=False, num_workers=48, pin_memory=True,
+                            collate_fn=collate_fn_2D_fib25_Train)
 
     def load_data_to_device(loader):
         tmp_loader = iter(loader)
@@ -239,7 +245,7 @@ if __name__ == '__main__':
 
     train_loader, val_loader = load_data_to_device(train_loader), load_data_to_device(val_loader)
 
-    ##创建log日志
+    ## 创建log日志
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     logfile = './output/log/log_{}.txt'.format(Save_Name)
@@ -272,7 +278,7 @@ if __name__ == '__main__':
     # training loop
     model.train()
     epoch = 0
-    Best_val_loss = 100000
+    Best_val_loss = 10000
     Best_epoch = 0
     early_stop_count = 100
     no_improve_count = 0
@@ -328,7 +334,7 @@ if __name__ == '__main__':
                 torch.save(model.module.state_dict(), './output/checkpoints/{}_Best_in_val.model'.format(Save_Name))
                 no_improve_count = 0
             else:
-                no_improve_count = no_improve_count + 1
+                no_improve_count += 1
 
             ##Record
             logging.info("Epoch {}: val_loss = {:.6f},with best val_loss = {:.6f} in epoch {}".format(

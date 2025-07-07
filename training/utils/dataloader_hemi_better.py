@@ -349,7 +349,6 @@ class Dataset_2D_hemi_Train(Dataset):
             return raw, labels,point_map,mask,affinity
 
 
-
 def collate_fn_2D_hemi_Train(batch):
     
     raw = np.array([item[0] for item in batch]).astype(np.float32)
@@ -754,13 +753,6 @@ def collate_fn_3D_hemi_Train(batch):
 
     # return raw, labels, mask_3D, affinity, point_map,lsds
     
-    
-    
-    
-    
-
-
-
 
 ###dataloader for SAM
 class SAM_Dataset_2D_hemi_Train(Dataset):
@@ -1098,8 +1090,6 @@ class SAM_Dataset_2D_hemi_Train(Dataset):
         else:
             return raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,affinity
             # return raw, labels,point_map,mask,affinity
-
-
 
 def collate_fn_2D_hemi_Train_SAM(batch):
     

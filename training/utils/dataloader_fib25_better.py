@@ -50,6 +50,7 @@ class Dataset_2D_fib25_Train(Dataset):
             labels = label(labels).astype(np.uint16)  # 读取通道0的标签信息，并设置好连通域
 
             print('data {}: raw shape={}, label shape = {}'.format(data_name, raw.shape, labels.shape))
+            # print('raw unique={}, label unique= {}'.format(data_name, np.unique(raw), np.unique(labels)))
 
             assert len(raw) == len(labels)
             if split == 'train':

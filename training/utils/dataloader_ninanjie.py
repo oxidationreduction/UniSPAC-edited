@@ -21,17 +21,19 @@ from torch.utils.data import Dataset
 ninanjie_data = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie'
 ninanjie_save = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie-save'
 
-def load_dataset(dataset_name: str, split: str='train', from_temp=True, require_lsd=True, require_xz_yz=True):
+def load_dataset(dataset_name: str, from_temp=True, require_lsd=True, require_xz_yz=True, crop_size=256):
     temp_name = f'{dataset_name}_{from_temp}_{require_lsd}_{require_xz_yz}'
     DATASET = Dataset_3D_ninanjie_Train if '3d' in dataset_name.lower() else Dataset_2D_ninanjie_Train
     if os.path.exists(os.path.join(ninanjie_save, temp_name)) and from_temp:
         print(f"Load {dataset_name} from disk...")
-        train_dataset = joblib.load(os.path.join(ninanjie_save, temp_name))
+        train_dataset, val_dataset = joblib.load(os.path.join(ninanjie_save, temp_name))
     else:
-        train_dataset = DATASET(data_dir=os.path.join(ninanjie_data), split=split, crop_size=256,
+        train_dataset = DATASET(data_dir=os.path.join(ninanjie_data), split='train', crop_size=crop_size,
                                                   require_lsd=require_lsd, require_xz_yz=require_xz_yz)
-        joblib.dump(train_dataset, os.path.join(ninanjie_save, temp_name))
-    return train_dataset
+        val_dataset = DATASET(data_dir=os.path.join(ninanjie_data), split='val', crop_size=crop_size,
+                                                  require_lsd=require_lsd, require_xz_yz=require_xz_yz)
+        joblib.dump((train_dataset, val_dataset), os.path.join(ninanjie_save, temp_name))
+    return train_dataset, val_dataset
 
 
 class Dataset_2D_ninanjie_Train(Dataset):
@@ -53,8 +55,7 @@ class Dataset_2D_ninanjie_Train(Dataset):
         self.images = list()
         self.masks = list()
 
-        data_list = ['first', 'fourth']
-        data_list = data_list * 8
+        data_list = ['first']
 
         # ##Debug
         # data_list = ['trvol-250-1.zarr']
@@ -62,32 +63,36 @@ class Dataset_2D_ninanjie_Train(Dataset):
         raw, labels = list(), list()
         for data in data_list:
             raw_dir = os.path.join(data_dir, data, 'raw')
-            labels_dir = os.path.join(data_dir, data, 'labels')
+            labels_dir = os.path.join(data_dir, data, 'label')
 
-            for image in os.listdir(raw_dir):
+            for image in tqdm.tqdm(os.listdir(raw_dir), desc=f"load dataset: {data}", leave=False):
                 # read image from disk, tiff
-                raw_img = Image.open(os.path.join(raw_dir, image))
+                try:
+                    raw_img = Image.open(os.path.join(raw_dir, image))
+                    label_img = Image.open(os.path.join(labels_dir, image))
+                    _, _ = raw_img.size, label_img.size
+                except FileNotFoundError as e:
+                    continue
                 raw.append(raw_img)
-                label_img = Image.open(os.path.join(labels_dir, image))
                 labels.append(label_img)
-        raw = np.array(raw)
-        labels = np.array(labels).astype(np.uint16)
 
-        raw_crop = []
-        labels_crop = []
-        lines, rows = (1, 1)
-        cropped_size = (raw.shape[1] // lines, raw.shape[2] // rows)
-        for line in range(lines):
-            for row in range(rows):
-                for raw_, labels_ in zip(raw, labels):
-                    raw_crop.append(raw_[line * cropped_size[0]:(line + 1) * cropped_size[0], row * cropped_size[1]:(row + 1) * cropped_size[1]])
-                    labels_crop.append(labels_[line * cropped_size[0]:(line + 1) * cropped_size[0], row * cropped_size[1]:(row + 1) * cropped_size[1]])
-        raw = np.array(raw_crop)
-        labels = label(np.array(labels_crop)).astype(np.uint16)
+        # print(f'unique: raw = {np.unique(raw)}, labels = {np.unique(labels)}')
 
-        print('raw shape={}, label shape = {}'.format(raw.shape, labels.shape))
+        # raw_crop = []
+        # labels_crop = []
+        # lines, rows = (1, 1)
+        # cropped_size = (raw.shape[1] // lines, raw.shape[2] // rows)
+        # for line in range(lines):
+        #     for row in range(rows):
+        #         for raw_, labels_ in zip(raw, labels):
+        #             raw_crop.append(raw_[line * cropped_size[0]:(line + 1) * cropped_size[0], row * cropped_size[1]:(row + 1) * cropped_size[1]])
+        #             labels_crop.append(labels_[line * cropped_size[0]:(line + 1) * cropped_size[0], row * cropped_size[1]:(row + 1) * cropped_size[1]])
+        # raw = np.array(raw_crop)
+        # labels = label(np.array(labels_crop)).astype(np.uint16)
 
-        val_size = 8 # if len(raw) > 40 else max(2, len(raw) // 5)
+        # print('raw shape={}, label shape = {}'.format(raw.shape, labels.shape))
+
+        val_size = 16 # if len(raw) > 40 else max(2, len(raw) // 5)
 
         if split == 'train':
             self.images.extend(raw[val_size:])
@@ -98,10 +103,10 @@ class Dataset_2D_ninanjie_Train(Dataset):
 
         if require_xz_yz:
             if split == 'train':
-                for n in range(val_size, raw.shape[1]):
+                for n in range(val_size, raw[0].size[0]):
                     self.images.append(raw[:, n, :])
                     self.masks.append(labels[:, n, :])
-                for n in range(val_size, labels.shape[2]):
+                for n in range(val_size, labels[0].size[1]):
                     self.images.append(raw[:, :, n])
                     self.masks.append(labels[:, :, n])
             elif split == 'val':

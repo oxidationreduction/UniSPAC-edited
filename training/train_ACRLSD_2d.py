@@ -4,7 +4,9 @@ import random
 
 import joblib
 import numpy as np
+import pandas as pd
 import torch
+from torchmetrics import functional
 from torch.utils.data import DataLoader, ConcatDataset
 from tqdm.auto import tqdm
 
@@ -93,14 +95,23 @@ def model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
         'affinity_logits': affinity_logits,
     }
 
-    return loss_value, outputs
+    results_ = {}
+    if not train_step:
+        affinity_output = affinity_output.squeeze()
+        gt_affinity = gt_affinity.squeeze()
+        results_['accuracy'] = functional.accuracy(affinity_output, gt_affinity, task='binary')
+        results_['precision'] = functional.precision(affinity_output, gt_affinity, task='binary')
+        results_['recall'] = functional.recall(affinity_output, gt_affinity, task='binary')
+        results_['f1_score'] = functional.f1_score(affinity_output, gt_affinity, task='binary')
+
+    return (loss_value, outputs) if train_step else (loss_value, outputs, results_)
 
 
 if __name__ == '__main__':
     ##设置超参数
     training_epochs = 1000
     learning_rate = 1e-4
-    batch_size = 8
+    batch_size = 80
     # Save_Name = 'ACRLSD_2D(hemi+fib25+cremi)'
     Save_Name = 'ACRLSD_2D(ninanjie)'
 
@@ -117,10 +128,10 @@ if __name__ == '__main__':
     # model = model.to(device)
 
     ##多卡训练
-    gpus = [0,2]#选中显卡
+    gpus = [2]#选中显卡
     torch.cuda.set_device('cuda:{}'.format(gpus[0]))
     model = torch.nn.DataParallel(model.cuda(), device_ids=gpus, output_device=gpus[0])
-    Save_Name = 'ACRLSD_2D(ninanjie)_multigpu'
+    Save_Name = 'ACRLSD_2D(fib25)_multigpu'
 
     ##装载数据
     # train_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/hemi/training/', split='train', crop_size=128,
@@ -157,10 +168,22 @@ if __name__ == '__main__':
     val_loader = DataLoader(val_dataset, batch_size=batch_size // 2, shuffle=False, num_workers=48, pin_memory=True,
                             collate_fn=collate_fn_2D_hemi_Train)
 
+    def load_data_to_device(loader):
+        res = []
+        for raw, labels, point_map, mask, gt_affinity, gt_lsds in loader:
+            raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
+            gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
+            gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
+                                          device=device)  # (batch, 2, height, width)
+            res.append((raw, labels, point_map, mask, gt_affinity, gt_lsds))
+        return res
+    train_loader, val_loader = load_data_to_device(train_loader), load_data_to_device(val_loader)
+
     ##创建log日志
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    logfile = '/home/liuhongyu2024/Downloads/UniSPAC-edited/output/log/log_{}.txt'.format(Save_Name)
+    logfile = './output/log/log_{}.txt'.format(Save_Name)
+    csvfile = './output/log/log_{}.csv'.format(Save_Name)
     fh = logging.FileHandler(logfile, mode='a', delay=False)
     fh.setLevel(logging.DEBUG)
     ch = logging.StreamHandler()
@@ -197,25 +220,22 @@ if __name__ == '__main__':
     early_stop_count = 100
     no_improve_count = 0
     with tqdm(total=training_epochs) as pbar:
+        analysis = pd.DataFrame(columns=['accuracy', 'precision', 'recall', 'f1'])
+        progress_desc, train_desc, val_desc = '', '', ''
         while epoch < training_epochs:
-            pbar.set_description(f"Best epoch: {epoch}, loss: {Best_val_loss:.2f}")
             ###################Train###################
             model.train()
             # reset data loader to get random augmentations
             np.random.seed()
             random.seed()
-            tmp_loader = iter(train_loader)
+            count, total = 0, len(train_loader)
             # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_loader:
-            for raw, labels, point_map, mask, gt_affinity, gt_lsds in tmp_loader:
-                ##Get Tensor
-                raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
-                gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
-                gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
-                                              device=device)  # (batch, 2, height, width)
-
+            for raw, labels, point_map, mask, gt_affinity, gt_lsds in train_loader:
                 loss_value, pred = model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation)
-            epoch += 1
-            pbar.update(1)
+                count = count + 1
+                progress_desc = f"Train {count}/{total}, "
+                train_desc = f"Best: {epoch}, loss: {Best_val_loss:.2f}, "
+                pbar.set_description(progress_desc + train_desc + val_desc)
 
             ###################Validate###################
             model.eval()
@@ -223,19 +243,24 @@ if __name__ == '__main__':
             seed = 98
             np.random.seed(seed)
             random.seed(seed)
-            tmp_val_loader = iter(val_loader)
+            count, total = 0, len(val_loader)
             acc_loss = []
             # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_val_loader:
-            for raw, labels, point_map, mask, gt_affinity, gt_lsds in tmp_val_loader:
-                raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
-                gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
-                gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
-                                              device=device)  # (batch, 2, height, width)
+            for raw, labels, point_map, mask, gt_affinity, gt_lsds in val_loader:
                 with torch.no_grad():
-                    loss_value, _ = model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
+                    loss_value, _, results = model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
                                                train_step=False)
-                acc_loss.append(loss_value.cpu().detach().numpy())
-            val_loss = np.mean(acc_loss)
+                count += 1
+                acc_loss.append(loss_value)
+                progress_desc = f"Val {count}/{total}, "
+                val_desc = (f"acc: {results['accuracy']:.4f}, prec: {results['precision']:.4f}, "
+                            f"recall: {results['recall']:.4f}, f1: {results['f1_score']:.4f}")
+                analysis.loc[len(analysis)] = [results['accuracy'], results['precision'], results['recall'],
+                                               results['f1_score']]
+
+                pbar.set_description(progress_desc + train_desc + val_desc)
+
+            val_loss = np.mean(np.array([loss_value.cpu().numpy() for loss_value in acc_loss]))
 
             ###################Compare###################
             if Best_val_loss > val_loss:
@@ -252,7 +277,9 @@ if __name__ == '__main__':
             fh.flush()
             ch.flush()
             # writer.add_scalar('val_loss', val_loss, epoch)
-
+            analysis.to_csv(csvfile)
+            epoch += 1
+            pbar.update(1)
             ##Early stop
             if no_improve_count == early_stop_count:
                 logging.info("Early stop!")

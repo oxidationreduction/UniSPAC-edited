@@ -5,11 +5,12 @@ from collections import OrderedDict
 
 import joblib
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader, ConcatDataset
 from tqdm.auto import tqdm
 
-# from torch.utils.tensorboard import SummaryWriter
+from torchmetrics import functional
 from models.unet2d import UNet2d
 from training.utils.dataloader_ninanjie import Dataset_2D_ninanjie_Train, load_dataset, collate_fn_2D_fib25_Train
 from utils.dataloader_ninanjie import Dataset_2D_ninanjie_Train
@@ -71,6 +72,12 @@ class ACRLSD(torch.nn.Module):
 
 
 def model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation, train_step=True):
+    def focal_loss(logits, targets, gamma=1.):
+        pt = torch.sigmoid(logits)
+        loss = -torch.mean((1.-pt) ** gamma * (targets * torch.log(pt + 1e-10) + (1-targets) * torch.log(1. - pt + 1e-10)))
+
+        return loss
+
     # zero gradients if training
     if train_step:
         optimizer.zero_grad()
@@ -78,7 +85,13 @@ def model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
     # forward
     lsd_logits, affinity_logits = model(raw)
 
-    loss_value = loss_fn(lsd_logits, gt_lsds) + loss_fn(affinity_logits, gt_affinity)
+    # loss_value = loss_fn(lsd_logits, gt_lsds) + loss_fn(affinity_logits, gt_affinity)
+
+    # loss_value = (loss_fn(lsd_logits, gt_lsds)
+    #               + loss_fn(affinity_logits[gt_affinity == 0], gt_affinity[gt_affinity == 0])
+    #               + loss_fn(affinity_logits[gt_affinity == 1], gt_affinity[gt_affinity == 1]))
+
+    loss_value = loss_fn(lsd_logits, gt_lsds) + focal_loss(affinity_logits, gt_affinity, gamma=1.)
 
     # backward if training mode
     if train_step:
@@ -95,28 +108,29 @@ def model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
         'affinity_logits': affinity_logits,
     }
 
-    return loss_value, outputs
+    results_ = {}
+    if not train_step:
+        affinity_output = affinity_output.squeeze()
+        gt_affinity = gt_affinity.squeeze()
+        results_['accuracy'] = functional.accuracy(affinity_output, gt_affinity, task='binary').item()
+        results_['precision'] = functional.precision(affinity_output, gt_affinity, task='binary').item()
+        results_['recall'] = functional.recall(affinity_output, gt_affinity, task='binary').item()
+        results_['f1_score'] = functional.f1_score(affinity_output, gt_affinity, task='binary').item()
 
-
-def remove_module(state_dict):
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        name = k[7:]  if k[:7] == 'module.' else k # 去掉 'module.' 前缀
-        new_state_dict[name] = v
-    return new_state_dict
+    return (loss_value, outputs) if train_step else (loss_value, outputs, results_)
 
 
 if __name__ == '__main__':
     ##设置超参数
-    training_epochs = 1000
+    training_epochs = 10000
     learning_rate = 1e-4
-    batch_size = 12
+    batch_size = 1
 
     set_seed()
 
     ###创建模型
     # set device
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
 
     model = ACRLSD()
@@ -125,10 +139,10 @@ if __name__ == '__main__':
     # model = model.to(device)
 
     ##多卡训练
-    gpus = [0,1]#选中显卡
+    gpus = [2]#选中显卡
     torch.cuda.set_device('cuda:{}'.format(gpus[0]))
     model = torch.nn.DataParallel(model.cuda(), device_ids=gpus, output_device=gpus[0])
-    Save_Name = 'ACRLSD_2D(ninanjie)_multigpu-no-xz-yz_no-crop'
+    Save_Name = 'ACRLSD_2D(ninanjie)'
 
     ##装载数据
     # train_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/hemi/training/', split='train', crop_size=128,
@@ -138,16 +152,13 @@ if __name__ == '__main__':
 
     ninanjie_data = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie'
     ninanjie_save = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie-save'
-    train_dataset_2 = load_dataset('ninanjie_train.joblib', 'train', require_xz_yz=False, from_temp=True)
-    val_dataset_2 = load_dataset('ninanjie_val.joblib', 'val', require_xz_yz=False, from_temp=True)
+    train_dataset, val_dataset = load_dataset('ninanjie_first', require_xz_yz=True, from_temp=True)
 
     # train_dataset_3 = Dataset_2D_cremi_Train(data_dir='../data/CREMI/', split='train', crop_size=128, require_lsd=True)
     # val_dataset_3 = Dataset_2D_cremi_Train(data_dir='../data/CREMI/', split='val', crop_size=128, require_lsd=True)
 
     # train_dataset = ConcatDataset([train_dataset_1, train_dataset_2])
     # val_dataset = ConcatDataset([val_dataset_1, val_dataset_2])
-    train_dataset = train_dataset_2
-    val_dataset = val_dataset_2
 
     # train_dataset = train_dataset_1
     # val_dataset = val_dataset_1
@@ -171,7 +182,8 @@ if __name__ == '__main__':
     ##创建log日志
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    logfile = '/home/liuhongyu2024/Downloads/UniSPAC-edited/output/log/log_{}.txt'.format(Save_Name)
+    logfile = './output/log/log_{}.txt'.format(Save_Name)
+    csvfile = './output/log/log_{}.csv'.format(Save_Name)
     fh = logging.FileHandler(logfile, mode='a', delay=False)
     fh.setLevel(logging.DEBUG)
     ch = logging.StreamHandler()
@@ -205,10 +217,14 @@ if __name__ == '__main__':
     epoch = 0
     Best_val_loss = 100000
     Best_epoch = 0
+    Best_model = None
     early_stop_count = 100
     no_improve_count = 0
     with tqdm(total=training_epochs) as pbar:
+        analysis = pd.DataFrame(columns=['accuracy', 'precision', 'recall', 'f1'])
+        progress_desc, train_desc, val_desc = '', '', ''
         while epoch < training_epochs:
+            epoch += 1
             ###################Train###################
             model.train()
             # reset data loader to get random augmentations
@@ -222,12 +238,11 @@ if __name__ == '__main__':
                 # gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
                 # gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
                 #                               device=device)  # (batch, 2, height, width)
-
+                count = count + 1
+                progress_desc = f"Train {count}/{total}, "
+                train_desc = f"loss: {Best_val_loss:.2f}, "
                 loss_value, pred = model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation)
-                pbar.set_description(f"Train {count}/{total}, Best: {epoch}, loss: {Best_val_loss:.2f}")
-                count += 1
-            epoch += 1
-            pbar.update(1)
+                pbar.set_description(progress_desc + train_desc + val_desc)
 
             ###################Validate###################
             model.eval()
@@ -244,31 +259,40 @@ if __name__ == '__main__':
                 # gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
                 #                               device=device)  # (batch, 2, height, width)
                 with torch.no_grad():
-                    loss_value, _ = model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
+                    loss_value, _, results = model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
                                                train_step=False)
-                acc_loss.append(loss_value)
-                pbar.set_description(f"Val {count}/{total}, Best: {epoch}, loss: {Best_val_loss:.4f}")
                 count += 1
-            val_loss = np.mean(np.array(loss_value.cpu().numpy() for loss_value in acc_loss))
+                acc_loss.append(loss_value)
+                progress_desc = f"Val {count}/{total}, "
+                analysis.loc[len(analysis)] = [results['accuracy'], results['precision'], results['recall'], results['f1_score']]
+
+            val_loss = np.mean(np.array([loss_value.cpu().numpy() for loss_value in acc_loss]))
 
             ###################Compare###################
             if Best_val_loss > val_loss:
                 Best_val_loss = val_loss
                 Best_epoch = epoch
-
-                torch.save(model.state_dict(), './output/checkpoints/{}_Best_in_val.model'.format(Save_Name))
+                Best_model = model.state_dict()
                 no_improve_count = 0
             else:
                 no_improve_count += 1
 
+            val_desc = (f"acc: {results['accuracy']:.4f}, prec: {results['precision']:.4f}, "
+                        f"recall: {results['recall']:.4f}, f1: {results['f1_score']:.4f}  ({epoch - Best_epoch})")
+            pbar.set_description(progress_desc + train_desc + val_desc)
+
             ## Record
             logging.info("Epoch {}: val_loss = {:.6f},with best val_loss = {:.6f} in epoch {}".format(
                 epoch, val_loss, Best_val_loss, Best_epoch))
-            fh.flush()
-            ch.flush()
-            # writer.add_scalar('val_loss', val_loss, epoch)
+
+            pbar.update(1)
 
             ##Early stop
             if no_improve_count == early_stop_count and epoch > 100:
                 logging.info("Early stop!")
                 break
+    fh.flush()
+    ch.flush()
+    # writer.add_scalar('val_loss', val_loss, epoch)
+    analysis.to_csv(csvfile)
+    torch.save(Best_model, './output/checkpoints/{}_Best_in_val.model'.format(Save_Name))
