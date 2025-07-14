@@ -1,8 +1,9 @@
+import multiprocessing
 from multiprocessing.pool import Pool
-import os.path
+import os
 import random
 from time import sleep
-
+os.environ["ALBUMENTATIONS_DISABLE_VERSION_CHECK"] = "1"
 import albumentations as A  ##一种数据增强库
 import joblib
 import numpy as np
@@ -18,34 +19,112 @@ from skimage.measure import label
 from torch.utils.data import Dataset
 
 
-ninanjie_data = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie'
-ninanjie_save = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie-save'
+ninanjie_data = './data/ninanjie'
+ninanjie_save = './data/ninanjie-save'
 
-def load_dataset(dataset_name: str, from_temp=True, require_lsd=True, require_xz_yz=True, crop_size=256):
-    temp_name = f'{dataset_name}_{from_temp}_{require_lsd}_{require_xz_yz}'
+def load_dataset(dataset_name: str, from_temp=True, require_lsd=True, require_xz_yz=True, crop_size=256, crop_xyz=None, chunk_position=None):
+    temp_name = f'{dataset_name}_{from_temp}_{require_lsd}_{require_xz_yz}_{crop_size}_{"".join((str(i) for i in crop_xyz))}_{"".join((str(i) for i in chunk_position))}'
     DATASET = Dataset_3D_ninanjie_Train if '3d' in dataset_name.lower() else Dataset_2D_ninanjie_Train
     if os.path.exists(os.path.join(ninanjie_save, temp_name)) and from_temp:
         print(f"Load {dataset_name} from disk...")
         train_dataset, val_dataset = joblib.load(os.path.join(ninanjie_save, temp_name))
     else:
         train_dataset = DATASET(data_dir=os.path.join(ninanjie_data), split='train', crop_size=crop_size,
-                                                  require_lsd=require_lsd, require_xz_yz=require_xz_yz)
+                                                  require_lsd=require_lsd, require_xz_yz=require_xz_yz,
+                                                    crop_xyz=crop_xyz, chunk_position=chunk_position)
         val_dataset = DATASET(data_dir=os.path.join(ninanjie_data), split='val', crop_size=crop_size,
-                                                  require_lsd=require_lsd, require_xz_yz=require_xz_yz)
+                                                  require_lsd=require_lsd, require_xz_yz=require_xz_yz,
+                                                    crop_xyz=crop_xyz, chunk_position=chunk_position)
         joblib.dump((train_dataset, val_dataset), os.path.join(ninanjie_save, temp_name))
     return train_dataset, val_dataset
+
+
+def _add_image(raw_dir_, labels_dir_, image_, crop_xy_, chunk_pos_):
+    try:
+        raw_img = Image.open(os.path.join(raw_dir_, image_))
+        label_img = Image.open(os.path.join(labels_dir_, image_))
+        assert(raw_img.size == label_img.size)
+        x_, y_ = raw_img.size
+    except FileNotFoundError as e:
+        return None, None
+    left, right = chunk_pos_[0] * x_ // crop_xy_[0], (chunk_pos_[0]+1) * x_ // crop_xy_[0]
+    upper, lower = chunk_pos_[1] * y_ // crop_xy_[1], (chunk_pos_[1]+1) * y_ // crop_xy_[1]
+
+    cropped_raw = raw_img.crop((left, upper, right, lower))
+    cropped_label = label_img.crop((left, upper, right, lower))
+
+    return cropped_raw, cropped_label
+
+
+def _load_images(data_dir, data_list):
+    with multiprocessing.Manager() as manager:
+        raw, labels = manager.list(), manager.list()
+        process_pool = Pool(processes=os.cpu_count() >> 1)
+        images = list()
+
+        for data in data_list:
+            raw_dir = os.path.join(data_dir, data, 'raw')
+            labels_dir = os.path.join(data_dir, data, 'label')
+
+            for image in os.listdir(raw_dir):
+                images.append((raw_dir, labels_dir, image))
+
+        results = []
+        for raw_dir, labels_dir, image in images:
+            result = process_pool.apply_async(_add_image, args=(raw_dir, labels_dir, image))
+            results.append(result)
+
+        pbar = tqdm.tqdm(total=len(images), desc="load dataset", leave=False)
+        for result in results:
+            raw_img, label_img = result.get()
+            if raw_img and label_img:
+                raw.append(raw_img)
+                labels.append(label_img)
+            pbar.update(1)
+        pbar.close()
+        process_pool.close()
+        process_pool.join()
+        raw, labels = list(raw), list(labels)
+        return raw, labels
+
+
+def _dump_data(data_list, data_dir='./data/ninanjie'):
+    raw, labels = [], []
+    for data in data_list:
+        raw_dir = os.path.join(data_dir, data, 'raw')
+        labels_dir = os.path.join(data_dir, data, 'label')
+
+        for image in tqdm.tqdm(os.listdir(raw_dir)):
+            raw_img, label_img = _add_image(raw_dir, labels_dir, image)
+            if raw_img and label_img:
+                raw.append(raw_img)
+                labels.append(label_img)
+        joblib.dump((raw, labels), os.path.join(ninanjie_save, "_".join(data_list)))
+
+
+if __name__ == "__main__":
+    _dump_data(['first'], ninanjie_data)
+
 
 
 class Dataset_2D_ninanjie_Train(Dataset):
     def __init__(
             self,
             data_dir='./data/ninanjie',  # 数据的路径
+            batch_num='first',
             split='train',  # 划分方式
             crop_size=None,  # 切割尺寸
             padding_size=8,
             require_lsd=False,
-            require_xz_yz=False):
+            require_xz_yz=False,
+            crop_xyz=None, # 将体块沿着xyz三轴分别均匀分成多少份
+            chunk_position=None, # 体块坐标
+    ):
 
+        if crop_xyz is None:
+            crop_xyz = [3, 3, 2]
+        if chunk_position is None:
+            chunk_position = [0, 0, 0]
         self.split = split
         self.crop_size = crop_size
         self.padding_size = padding_size
@@ -55,27 +134,9 @@ class Dataset_2D_ninanjie_Train(Dataset):
         self.images = list()
         self.masks = list()
 
-        data_list = ['first']
-
         # ##Debug
         # data_list = ['trvol-250-1.zarr']
-
-        raw, labels = list(), list()
-        for data in data_list:
-            raw_dir = os.path.join(data_dir, data, 'raw')
-            labels_dir = os.path.join(data_dir, data, 'label')
-
-            for image in tqdm.tqdm(os.listdir(raw_dir), desc=f"load dataset: {data}", leave=False):
-                # read image from disk, tiff
-                try:
-                    raw_img = Image.open(os.path.join(raw_dir, image))
-                    label_img = Image.open(os.path.join(labels_dir, image))
-                    _, _ = raw_img.size, label_img.size
-                except FileNotFoundError as e:
-                    continue
-                raw.append(raw_img)
-                labels.append(label_img)
-
+        # raw, labels = _load_images(data_dir, data_list)
         # print(f'unique: raw = {np.unique(raw)}, labels = {np.unique(labels)}')
 
         # raw_crop = []
@@ -92,7 +153,34 @@ class Dataset_2D_ninanjie_Train(Dataset):
 
         # print('raw shape={}, label shape = {}'.format(raw.shape, labels.shape))
 
-        val_size = 16 # if len(raw) > 40 else max(2, len(raw) // 5)
+        val_size = 32 # if len(raw) > 40 else max(2, len(raw) // 5)
+
+        raw, labels = [], []
+        raw_dir = os.path.join(data_dir, batch_num, 'raw')
+        labels_dir = os.path.join(data_dir, batch_num, 'label')
+
+        z_start, z_end = chunk_position[2] * len(os.listdir(raw_dir)) // crop_xyz[2],\
+                    (chunk_position[2] + 1) * len(os.listdir(raw_dir)) // crop_xyz[2]
+
+        multi_pool = Pool(os.cpu_count() >> 1)
+        results = []
+        for image in os.listdir(raw_dir)[z_start:z_end]:
+            results.append(multi_pool.apply_async(_add_image, args=(raw_dir, labels_dir, image, crop_xyz[:2], chunk_position[:2])))
+        pbar = tqdm.tqdm(total=len(results), desc='load images', leave=False)
+        for result in results:
+            raw_img, label_img = result.get()
+            if raw_img and label_img:
+                raw.append(raw_img)
+                labels.append(label_img)
+            pbar.update(1)
+        pbar.close()
+        multi_pool.close()
+        multi_pool.join()
+
+        raw = np.array(raw)
+        labels = np.array(labels)
+
+        print(f'image loaded, now shape: {raw.shape}')
 
         if split == 'train':
             self.images.extend(raw[val_size:])
@@ -103,10 +191,10 @@ class Dataset_2D_ninanjie_Train(Dataset):
 
         if require_xz_yz:
             if split == 'train':
-                for n in range(val_size, raw[0].size[0]):
+                for n in range(val_size, raw[0].shape[0]):
                     self.images.append(raw[:, n, :])
                     self.masks.append(labels[:, n, :])
-                for n in range(val_size, labels[0].size[1]):
+                for n in range(val_size, labels[0].shape[1]):
                     self.images.append(raw[:, :, n])
                     self.masks.append(labels[:, :, n])
             elif split == 'val':
@@ -115,15 +203,37 @@ class Dataset_2D_ninanjie_Train(Dataset):
                     self.masks.append(labels[:, n, :])
                     self.images.append(raw[:, :, n])
                     self.masks.append(labels[:, :, n])
+            print('require_xz_yz done.')
 
         self.data_pack = []
-        for idx in tqdm.tqdm(range(len(self.images))):
+        invalid_count = 0
+        pbar = tqdm.tqdm(range(len(self.images)))
+        for idx in pbar:
             sub_data = self.prework(idx)
             if sub_data is not None:
                 self.data_pack.append(sub_data)
             else:
-                print(f"data index={idx} is invalid.")
-                # sleep(1)
+                invalid_count += 1
+            pbar.set_description(f'preprocessing, invalid: {invalid_count}')
+
+
+        # multi_pool = Pool(4)
+        # results = []
+        # for idx in range(len(self.images)):
+        #     results.append(multi_pool.apply_async(self.prework, args=(idx,)))
+        # pbar = tqdm.tqdm(total=len(results), desc='preprocessing', leave=False)
+        # for result in results:
+        #     sub_data = result.get()
+        #     if sub_data is not None:
+        #         self.data_pack.append(sub_data)
+        #     else:
+        #         invalid_count += 1
+        #         # sleep(1)
+        #     pbar.set_description(f'preprocessing, invalid: {invalid_count}')
+        #     pbar.update(1)
+        # pbar.close()
+        # multi_pool.close()
+        # multi_pool.join()
 
         # pool = Pool(8)
         # results = []

@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader, ConcatDataset
 from tqdm.auto import tqdm
 
-from torchmetrics import functional
+# from torchmetrics import functional
 from models.unet2d import UNet2d
 from training.utils.dataloader_ninanjie import Dataset_2D_ninanjie_Train, load_dataset, collate_fn_2D_fib25_Train
 from utils.dataloader_ninanjie import Dataset_2D_ninanjie_Train
@@ -85,13 +85,13 @@ def model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
     # forward
     lsd_logits, affinity_logits = model(raw)
 
-    # loss_value = loss_fn(lsd_logits, gt_lsds) + loss_fn(affinity_logits, gt_affinity)
+    loss_value = loss_fn(lsd_logits, gt_lsds) + loss_fn(affinity_logits, gt_affinity)
 
     # loss_value = (loss_fn(lsd_logits, gt_lsds)
     #               + loss_fn(affinity_logits[gt_affinity == 0], gt_affinity[gt_affinity == 0])
     #               + loss_fn(affinity_logits[gt_affinity == 1], gt_affinity[gt_affinity == 1]))
 
-    loss_value = loss_fn(lsd_logits, gt_lsds) + focal_loss(affinity_logits, gt_affinity, gamma=1.)
+    # loss_value = loss_fn(lsd_logits, gt_lsds) + focal_loss(affinity_logits, gt_affinity, gamma=1.)
 
     # backward if training mode
     if train_step:
@@ -110,12 +110,33 @@ def model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
 
     results_ = {}
     if not train_step:
-        affinity_output = affinity_output.squeeze()
+        affinity_output = (affinity_output.squeeze() >= 0.5).float()
         gt_affinity = gt_affinity.squeeze()
-        results_['accuracy'] = functional.accuracy(affinity_output, gt_affinity, task='binary').item()
-        results_['precision'] = functional.precision(affinity_output, gt_affinity, task='binary').item()
-        results_['recall'] = functional.recall(affinity_output, gt_affinity, task='binary').item()
-        results_['f1_score'] = functional.f1_score(affinity_output, gt_affinity, task='binary').item()
+        # results_['accuracy'] = functional.accuracy(affinity_output, gt_affinity, task='binary').item()
+        # results_['precision'] = functional.precision(affinity_output, gt_affinity, task='binary').item()
+        # results_['recall'] = functional.recall(affinity_output, gt_affinity, task='binary').item()
+        # results_['f1_score'] = functional.f1_score(affinity_output, gt_affinity, task='binary').item()
+        # 计算真正例(TP)、假正例(FP)、真反例(TN)、假反例(FN)
+        TP = torch.sum((affinity_output == 1) & (gt_affinity == 1)).float()
+        FP = torch.sum((affinity_output == 1) & (gt_affinity == 0)).float()
+        TN = torch.sum((affinity_output == 0) & (gt_affinity == 0)).float()
+        FN = torch.sum((affinity_output == 0) & (gt_affinity == 1)).float()
+
+        # 计算分母（避免除零）
+        total = TP + FP + TN + FN
+        positives = TP + FN
+        predicted_positives = TP + FP
+
+        # 计算四项指标
+        results_['accuracy'] = (TP + TN) / total if total > 0 else torch.tensor(0.0)
+        results_['precision'] = TP / predicted_positives if predicted_positives > 0 else torch.tensor(0.0)
+        results_['recall'] = TP / positives if positives > 0 else torch.tensor(0.0)
+        results_['f1_score'] = 2 * (results_['precision'] * results_['recall']) / (
+                    results_['precision'] + results_['recall']) \
+            if (results_['precision'] + results_['recall']) > 0 else torch.tensor(0.0)
+
+        # 转换为标量值
+        results_ = {k: v.item() for k, v in results_.items()}
 
     return (loss_value, outputs) if train_step else (loss_value, outputs, results_)
 
@@ -124,13 +145,13 @@ if __name__ == '__main__':
     ##设置超参数
     training_epochs = 10000
     learning_rate = 1e-4
-    batch_size = 1
+    batch_size = 192
 
     set_seed()
 
     ###创建模型
     # set device
-    device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
 
     model = ACRLSD()
@@ -139,7 +160,7 @@ if __name__ == '__main__':
     # model = model.to(device)
 
     ##多卡训练
-    gpus = [2]#选中显卡
+    gpus = [3,4,5]#选中显卡
     torch.cuda.set_device('cuda:{}'.format(gpus[0]))
     model = torch.nn.DataParallel(model.cuda(), device_ids=gpus, output_device=gpus[0])
     Save_Name = 'ACRLSD_2D(ninanjie)'
@@ -150,9 +171,10 @@ if __name__ == '__main__':
     # val_dataset_1 = Dataset_2D_hemi_Train(data_dir='./data/hemi/training/', split='val', crop_size=128,
     #                                       require_lsd=True, require_xz_yz=True)
 
-    ninanjie_data = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie'
-    ninanjie_save = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie-save'
-    train_dataset, val_dataset = load_dataset('ninanjie_first', require_xz_yz=True, from_temp=True)
+    ninanjie_data = './data/ninanjie'
+    ninanjie_save = './data/ninanjie-save'
+    train_dataset, val_dataset = load_dataset('first', require_xz_yz=True, from_temp=True,
+                                              crop_xyz=[3,3,2], chunk_position=[1,1,0])
 
     # train_dataset_3 = Dataset_2D_cremi_Train(data_dir='../data/CREMI/', split='train', crop_size=128, require_lsd=True)
     # val_dataset_3 = Dataset_2D_cremi_Train(data_dir='../data/CREMI/', split='val', crop_size=128, require_lsd=True)
@@ -266,7 +288,8 @@ if __name__ == '__main__':
                 progress_desc = f"Val {count}/{total}, "
                 analysis.loc[len(analysis)] = [results['accuracy'], results['precision'], results['recall'], results['f1_score']]
 
-            val_loss = np.mean(np.array([loss_value.cpu().numpy() for loss_value in acc_loss]))
+            # val_loss = np.mean(np.array([loss_value.cpu().numpy() for loss_value in acc_loss]))
+            val_loss = torch.stack([loss_value.cpu() for loss_value in acc_loss]).mean().item()
 
             ###################Compare###################
             if Best_val_loss > val_loss:

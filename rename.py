@@ -33,26 +33,27 @@ def resize_tif_image(input_path, output_path, image_name):
 #     img_name = '0001.tif'
 #     print(resize_tif_image(input_dir, output_dir, img_name))
 
+def rename_file(label_dir, image_name):
+    if len(image_name.split('.')[0]) == 5:
+        os.rename(os.path.join(label_dir, image_name), os.path.join(label_dir, image_name[1:]))
+
 
 if __name__ == "__main__":
     # 输入和输出文件路径（请根据实际情况修改）
     for dataset in ['fourth_1', 'fourth_2', 'fourth_3']:
         input_dir = os.path.join(os.path.dirname(__file__), 'data', 'ninanjie', dataset)
-        output_dir = os.path.join(os.path.dirname(__file__), 'data', 'ninanjie', dataset, f'raw_{dataset}')
-        os.makedirs(output_dir, exist_ok=True)
 
         process_pool = Pool(os.cpu_count() >> 1)
-        raw_images = os.listdir(os.path.join(input_dir, 'raw'))
-        pbar = tqdm.tqdm(total=len(raw_images), desc=dataset)
+        label_images = os.listdir(os.path.join(input_dir, 'label'))
+        pbar = tqdm.tqdm(total=len(label_images), desc=dataset)
         results = []
-        for image_file in raw_images:
-            result = process_pool.apply_async(resize_tif_image, args=(input_dir, output_dir, image_file))
-            results.append(result)
-        err_count = 0
-        for result in results:
-            err_count += 0 if result.get() else 1
+        for image_file in label_images:
+            # result = process_pool.apply_async(rename_file, args=(input_dir, image_file))
+            rename_file(os.path.join(input_dir, 'label'), image_file)
+            # results.append(result)
+        # for result in results:
             pbar.update(1)
-            pbar.set_description(f"{dataset}, err_count: {err_count}")
+            pbar.set_description(dataset)
         pbar.close()
         process_pool.close()
         process_pool.join()
