@@ -50,8 +50,8 @@ if __name__ == "__main__":
         for image_file in label_images:
             # result = process_pool.apply_async(rename_file, args=(input_dir, image_file))
             rename_file(os.path.join(input_dir, 'label'), image_file)
-            # results.append(result)
-        # for result in results:
+            # metrics.append(result)
+        # for result in metrics:
             pbar.update(1)
             pbar.set_description(dataset)
         pbar.close()

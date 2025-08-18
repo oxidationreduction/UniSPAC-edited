@@ -1,18 +1,19 @@
 import logging
 import os
 import random
-from collections import OrderedDict
 
 import joblib
 import numpy as np
 import pandas as pd
 import torch
+from skimage.metrics import variation_of_information
 from torch.utils.data import DataLoader, ConcatDataset
 from tqdm.auto import tqdm
 
 # from torchmetrics import functional
 from models.unet2d import UNet2d
-from training.utils.dataloader_ninanjie import Dataset_2D_ninanjie_Train, load_train_dataset, collate_fn_2D_fib25_Train
+from training.utils.dataloader_ninanjie import Dataset_2D_ninanjie_Train, load_train_dataset, collate_fn_2D_fib25_Train, \
+    get_acc_prec_recall_f1, load_semantic_dataset
 from utils.dataloader_ninanjie import Dataset_2D_ninanjie_Train
 from utils.dataloader_hemi_better import Dataset_2D_hemi_Train, collate_fn_2D_hemi_Train
 
@@ -93,6 +94,12 @@ def model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
         'pred_affinity': affinity_output,
         'affinity_logits': affinity_logits,
     }
+
+    if not train_step:
+        outputs.update({
+            'voi': sum(variation_of_information(affinity_output.squeeze(), gt_affinity.squeeze()))
+        })
+
     return loss_value, outputs
 
 
@@ -124,16 +131,8 @@ def weighted_model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, ac
     fg_weight_lsds = bg_pixels_lsds / (fg_pixels_lsds + 1e-5) if fg_pixels_lsds > 0 else 1.0
 
     # 生成像素级权重矩阵（前景区域用fg_weight，背景用1.0）
-    weights_affinity = torch.where(
-        torch.tensor(fg_mask_affinity == 1.0, device=gt_affinity.device),
-        torch.tensor(fg_weight_affinity, device=gt_affinity.device),
-        torch.tensor(1.0, device=gt_affinity.device)
-    )
-    weights_lsds = torch.where(
-        torch.tensor(fg_mask_lsds == 1.0, device=gt_lsds.device),
-        torch.tensor(fg_weight_lsds, device=gt_lsds.device),
-        torch.tensor(1.0, device=gt_lsds.device)
-    )
+    weights_affinity = torch.where(fg_mask_affinity == 1.0, fg_weight_affinity, torch.tensor(1.0, device=device)).to(device)
+    weights_lsds = torch.where(fg_mask_lsds == 1.0, fg_weight_lsds, torch.tensor(1.0, device=device)).to(device)
 
     # --------------------------
     # 2. 计算加权损失
@@ -162,12 +161,20 @@ def weighted_model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, ac
     lsd_output = activation(lsd_logits)
     affinity_output = activation(affinity_logits)
 
+    affinity_output = affinity_output.detach().cpu()
+    gt_affinity = gt_affinity.cpu()
+
     outputs = {
         'pred_lsds': lsd_output,
         'lsds_logits': lsd_logits,
         'pred_affinity': affinity_output,
         'affinity_logits': affinity_logits,
     }
+    if not train_step:
+        outputs.update({
+            'voi': sum(variation_of_information(np.asarray((affinity_output.squeeze() > 0.5) + 0),
+                                                np.asarray(gt_affinity.squeeze(), dtype=np.int16)))
+        })
     return loss_value, outputs
 
 
@@ -181,7 +188,7 @@ if __name__ == '__main__':
 
     ###创建模型
     # set device
-    os.environ['CUDA_VISIBLE_DEVICES'] = '3,4,5'
+    os.environ['CUDA_VISIBLE_DEVICES'] = '2,3,4,5'
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
     gpus = [i for i in range(len(os.environ['CUDA_VISIBLE_DEVICES'].split(',')))]
@@ -189,20 +196,19 @@ if __name__ == '__main__':
     model = ACRLSD().to(device)
     model = torch.nn.DataParallel(model.cuda(), device_ids=gpus, output_device=gpus[0])
     dataset_names = ['second_6', 'fourth_1']
-    class_num = 3
 
-    Save_Name = f'ACRLSD_2D(ninanjie)_subcell_{class_num}'
+    Save_Name = f'ACRLSD_2D(ninanjie)_semantic'
 
     ##装载数据
-    crop_xyz = [4, 4, 1]
+    crop_xyz = [3, 3, 1]
     train_dataset, val_dataset = [], []
     for dataset_name in dataset_names:
         for i in range(crop_xyz[0]-1):
             for j in range(crop_xyz[1]):
                 for k in range(crop_xyz[2]):
-                    train_tmp, val_tmp = load_train_dataset(dataset_name, raw_dir='raw', label_dir='export',
-                                                            from_temp=True, require_xz_yz=False, crop_size=512,
-                                                            crop_xyz=crop_xyz, chunk_position=[i, j, k])
+                    train_tmp, val_tmp = load_semantic_dataset(dataset_name, raw_dir='raw', label_dir='export',
+                                                      require_xz_yz=False, from_temp=True, crop_size=600,
+                                                      crop_xyz=crop_xyz, chunk_position=[i, j, k])
                     train_dataset.append(train_tmp)
                     val_dataset.append(val_tmp)
 
@@ -223,6 +229,7 @@ if __name__ == '__main__':
                                           device=device)  # (batch, 2, height, width)
             res.append((raw, labels, point_map, mask, gt_affinity, gt_lsds))
         return res
+
     train_loader, val_loader = load_data_to_device(train_loader), load_data_to_device(val_loader)
 
     ##创建log日志
@@ -292,7 +299,8 @@ if __name__ == '__main__':
             seed = 98
             np.random.seed(seed)
             random.seed(seed)
-            acc_loss = []
+            acc_loss, voi_vals = [], []
+            metrics = np.array([0,0,0,0], dtype=np.float32)
             count, total = 0, len(val_loader)
             # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_val_loader:
             for raw, labels, point_map, mask, gt_affinity, gt_lsds in val_loader:
@@ -301,15 +309,21 @@ if __name__ == '__main__':
                 # gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
                 #                               device=device)  # (batch, 2, height, width)
                 with torch.no_grad():
-                    loss_value, _ = weighted_model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
+                    loss_value, output = weighted_model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
                                                train_step=False)
+                    y_pred = np.asarray(output['pred_affinity'].detach().cpu()).squeeze().flatten()
+                    gt_affinity = np.asarray(gt_affinity.detach().cpu()).squeeze().flatten()
                 count += 1
                 acc_loss.append(loss_value)
+                voi_vals.append(output['voi'])
+                metrics += np.asarray(get_acc_prec_recall_f1(y_pred, gt_affinity))
                 progress_desc = f"Val {count}/{total}, "
                 pbar.set_description(progress_desc + train_desc + val_desc)
 
             # val_loss = np.mean(np.array([loss_value.cpu().numpy() for loss_value in acc_loss]))
             val_loss = torch.stack([loss_value.cpu() for loss_value in acc_loss]).mean().item()
+            voi = np.mean(voi_vals)
+            metrics /= (total + 0.)
 
             ###################Compare###################
             if Best_val_loss > val_loss:
@@ -320,7 +334,7 @@ if __name__ == '__main__':
             else:
                 no_improve_count += 1
 
-            val_desc = f'best epoch {Best_epoch}'
+            val_desc = f'best {Best_epoch}, {"-".join([f"{metric:.4f}" for metric in metrics])}, VOI: {voi:.4f}'
             ## Record
             logging.info("Epoch {}: val_loss = {:.6f},with best val_loss = {:.6f} in epoch {}".format(
                 epoch, val_loss, Best_val_loss, Best_epoch))

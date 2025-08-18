@@ -357,10 +357,10 @@ class SAMneuro2D(nn.Module):
                 return_logits = False,
             )
         
-        # y_mask = self.sigmoid(y_mask)
+        # y_pred = self.sigmoid(y_pred)
         
         '''
-        y_mask: tensor, shape=(Height * Width)
+        y_pred: tensor, shape=(Height * Width)
         scores: tensor, shape=(1)
         logits: tensor, shape=(H_down * W_down)
         '''

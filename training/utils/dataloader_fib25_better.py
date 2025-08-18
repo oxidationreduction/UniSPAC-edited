@@ -3,6 +3,7 @@ import random
 
 import albumentations as A  ##一种数据增强库
 import numpy as np
+import torch
 import zarr
 from lsd.train import local_shape_descriptor
 from scipy.ndimage import binary_erosion
@@ -12,6 +13,301 @@ from scipy.stats import multivariate_normal
 from skimage.measure import label
 from torch.utils.data import Dataset
 import tqdm
+
+
+class Dataset_2D_fib25_Origin(Dataset):
+    def __init__(
+            self,
+            data_dir='./data/fib25/training/',  # 数据的路径
+            ):
+
+        ###装载FIB-25的训练数据
+        self.images = list()
+        self.masks = list()
+        ##装载数据
+        # data_list = ['trvol-250-1.zarr', 'trvol-250-2.zarr', 'tstvol-520-1.zarr', 'tstvol-520-2.zarr']
+        # data_list = data_list * 8
+
+        # ##Debug
+        data_list = ['trvol-250-1.zarr']
+
+        for data_name in data_list:
+            zarr_path = os.path.join(data_dir, data_name)
+            f = zarr.open(zarr_path, mode='r')
+            volumes = f['volumes']
+            raw = volumes['raw']  # zyx
+            labels = volumes['labels']['neuron_ids']  # zyx
+
+            labels = label(labels).astype(np.uint16)  # 读取通道0的标签信息，并设置好连通域
+
+            print('data {}: raw shape={}, label shape = {}'.format(data_name, raw.shape, labels.shape))
+            # print('raw unique={}, label unique= {}'.format(data_name, np.unique(raw), np.unique(labels)))
+
+            self.images.extend(raw)
+            self.masks.extend(labels)
+
+        self.data_pack = []
+        for item in zip(self.images, self.masks):
+            self.data_pack.append(item)
+        # for idx in tqdm(range(len(self.images))):
+        #     self.data_pack.append(self.prework(idx))
+
+    def __len__(self):
+        return len(self.data_pack)
+
+    # function to erode label boundaries，即腐蚀边界
+    def erode(self, labels, iterations, border_value):
+
+        foreground = np.zeros_like(labels, dtype=bool)  # 和标签维度相同的全False矩阵
+
+        # loop through unique labels
+        for label in np.unique(labels):  # 遍历标签信息（切割块）中所有的连通域的值
+
+            # skip background
+            if label == 0:
+                continue
+
+            # mask to label
+            label_mask = labels == label  # 当前连通域对应的标签（背景为False，当前连通域为True）
+
+            # erode labels
+            eroded_mask = binary_erosion(
+                label_mask,
+                iterations=iterations,
+                border_value=border_value)  # 获得iterations轮腐蚀后的当前连通域的标签
+
+            # get foreground
+            foreground = np.logical_or(eroded_mask, foreground)  # 这个前景相当于所有连通域经过边界腐蚀后得到的前景，前景用True标出
+
+        # and background...
+        background = np.logical_not(foreground)
+
+        # set eroded pixels to zero
+        labels[background] = 0
+
+        return labels
+
+    # takes care of padding
+    def get_padding(self, crop_size, padding_size):
+
+        # quotient
+        q = int(crop_size / padding_size)
+
+        if crop_size % padding_size != 0:
+            padding = (padding_size * (q + 1))
+        else:
+            padding = crop_size
+
+        return padding
+
+        # sample augmentations (see https://albumentations.ai/docs/examples/example_kaggle_salt)
+
+    def augment_data(self, raw, mask, padding):
+
+        transform = A.Compose([
+            A.RandomCrop(
+                width=self.crop_size,
+                height=self.crop_size),  # 1. 随机切割成 crop_size * crop_size 的尺寸
+            A.PadIfNeeded(
+                min_height=padding,
+                min_width=padding,
+                p=1,
+                border_mode=0),
+            # 2. 填充成 padding * padding 的尺寸，border_mode=0似乎是常数填充（参考：https://wenku.csdn.net/answer/b124adffba28441daf7b260623a28d87）
+            A.HorizontalFlip(p=0.3),  # 3. 以0.3的概率进行水平翻转
+            A.VerticalFlip(p=0.3),  # 4. 以0.3的概率进行垂直翻转
+            A.RandomRotate90(p=0.3),  # 5. 以0.3的概率进行垂随机旋转90度
+            A.Transpose(p=0.3),  # 6. 以0.3的概率进行转置
+            A.RandomBrightnessContrast(p=0.3)  # 7. 以0.3的概率随机改变输入图像的亮度和对比度。
+        ])  ## 数据增强
+
+        transformed = transform(image=raw, mask=mask)
+
+        raw, mask = transformed['image'], transformed['mask']
+
+        return raw, mask  ## 图像和标签的维度都是： padding * padding
+
+    # normalize raw data between 0 and 1
+    def normalize(self, data):
+        return (data - np.min(data)) / (np.max(data) - np.min(data)).astype(np.float32)
+
+    def get_prompt(self, labels):
+
+        ##
+        Points_pos = list()
+        Points_lab = list()
+        Boxes = list()
+        mask = np.zeros_like(labels, bool)
+        p_default = np.random.rand()
+
+        ##
+        total_unique_labels = np.unique(labels).tolist()
+        point_style = random.choice(['+', '-', '+-'])
+        if p_default < 0.5:
+            mask = (labels != 0)
+            return None, None, None, mask
+        else:
+            # p_label_contain = random.choice(['1','1','1','2','2','2','3','3','3',0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+            p_label_contain = random.choice([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+
+        ###产生Points
+        # if isinstance(p_label_contain,str):
+        #     temp_list = deepcopy(total_unique_labels)
+        #     temp_list.remove(0)
+        #     random.shuffle(temp_list)
+        #     labels_contain = total_unique_labels[:int(p_label_contain)]
+        #     labels_exclude = total_unique_labels[int(p_label_contain):]
+        # else:
+        while (1):
+            labels_contain = list()
+            labels_exclude = list()
+            for label in total_unique_labels:
+                p_label = np.random.rand()
+                if p_label < p_label_contain and label != 0:
+                    labels_contain.append(label)
+                else:
+                    labels_exclude.append(label)
+            if len(labels_contain) != 0:
+                break
+
+        ##Get Points(+) and boxes
+        for label in labels_contain:
+            mask_label = (labels == label)
+
+            ##Mask
+            mask = np.logical_or(mask, mask_label)
+
+            idx_label = np.where(mask_label)
+            y_list = idx_label[0]
+            x_list = idx_label[1]
+
+            ##Point(+)
+            idx = random.choice(np.arange(len(x_list)).tolist())
+            # idx = int(len(x_list)/2)
+            if '+' in point_style or len(labels_contain) == 1:
+                Points_pos.append([x_list[idx], y_list[idx]])
+                Points_lab.append(1)
+
+            ##Box
+            # if Get_box:
+            box = [np.min(x_list), np.min(y_list), np.max(x_list), np.max(y_list)]
+            Boxes.append(box)
+
+        ##Get Points(-)
+        for label in labels_exclude:
+            mask_label = (labels == label)
+            idx_label = np.where(mask_label)
+            y_list = idx_label[0]
+            x_list = idx_label[1]
+
+            idx = random.choice(np.arange(len(x_list)).tolist())
+            # idx = int(len(x_list)/2)
+            if '-' in point_style:
+                Points_pos.append([x_list[idx], y_list[idx]])
+                Points_lab.append(0)
+
+        return Points_pos, Points_lab, Boxes, mask
+
+    def generate_gaussian_matrix(self, Points_pos, Points_lab, H, W, theta=10):
+        if Points_pos == None:
+            total_matrix = np.ones((H, W))
+            return total_matrix
+
+        total_matrix = np.zeros((H, W))
+
+        record_list = list()
+        for n, (X, Y) in enumerate(Points_pos):
+            if (X, Y) not in record_list:
+                record_list.append((X, Y))
+            else:
+                continue
+
+            # 生成坐标网格
+            x, y = np.meshgrid(np.arange(W), np.arange(H))
+            pos = np.dstack((x, y))
+
+            # 以 (X, Y) 为中心，theta 为标准差生成高斯分布
+            rv = multivariate_normal(mean=[X, Y], cov=[[theta, 0], [0, theta]])
+
+            # 计算高斯分布在每个像素上的值
+            matrix = rv.pdf(pos)
+            ##normalize
+            matrix = matrix * (1 / np.max(matrix))
+
+            total_matrix = total_matrix + matrix * (Points_lab[n] * 2 - 1)
+            # total_matrix = total_matrix + matrix
+
+        if np.max(Points_lab) == 0:
+            total_matrix = total_matrix * 2 + 1
+
+        return total_matrix
+
+    # 展示一下求Affinity
+    def getAffinity(self, labels):
+        '''
+        labels为2维: 长*宽
+        Return: Affinity为3维, 2*长*宽,其中2对应了长(x)、宽(y)两个方向上的梯度
+        '''
+        label_shift = np.pad(labels, ((0, 1), (0, 1)), 'edge')
+
+        affinity_x = np.expand_dims(((labels - label_shift[1:, :-1]) != 0) + 0, axis=0)
+        affinity_y = np.expand_dims(((labels - label_shift[:-1, 1:]) != 0) + 0, axis=0)
+
+        affinity = np.concatenate([affinity_x, affinity_y], axis=0).astype('float32')
+
+        return affinity
+
+    def prework(self, idx):
+        raw = self.images[idx]  # 获得第idx张图像
+        labels = self.masks[idx]  # 获得第idx张图像的标签信息
+
+        # if self.split == 'val':
+        #     seed = 1000
+        #     np.random.seed(seed)
+        #     random.seed(seed)
+        # os.environ['PYTHONHASHSEED'] = str(seed)
+
+        raw = self.normalize(raw)  # 所有像素值归一化
+
+        # relabel connected components
+        # labels = label(labels).astype(np.uint16)  # 读取通道0的标签信息，并设置好连通域
+        # labels = labels.astype(np.uint16)  # 读取通道0的标签信息，并设置好连通域
+
+        padding = self.get_padding(self.crop_size, self.padding_size)  # padding_size的整数倍，>= crop_size
+        raw, labels = self.augment_data(raw, labels, padding)
+
+        raw = np.expand_dims(raw, axis=0)  # 1* 图像维度
+
+        # if train/val, generate our gt labels
+        ## 非测试数据的话，进行一轮边界腐蚀
+        labels = self.erode(
+            labels,
+            iterations=1,  # 腐蚀的迭代次数
+            border_value=1)  # 边界值
+
+        affinity = self.getAffinity(labels)
+
+        if self.require_lsd:
+            lsds = local_shape_descriptor.get_local_shape_descriptors(
+                segmentation=labels,
+                sigma=(5,) * 2,
+                voxel_size=(1,) * 2)  ##获得lsd标签，维度为：6*图像维度
+
+            lsds = lsds.astype(np.float32)  # 6* 图像维度
+
+        Points_pos, Points_lab, Boxes, mask = self.get_prompt(labels)
+
+        point_map = self.generate_gaussian_matrix(Points_pos, Points_lab, self.crop_size, self.crop_size, theta=30)
+
+        if self.require_lsd:
+            # return raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,affinity,lsds
+            return raw, labels, point_map, mask, affinity, lsds
+        else:
+            # return raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,affinity
+            return raw, labels, point_map, mask, affinity
+
+    def __getitem__(self, idx):
+        return self.data_pack[idx]
 
 
 class Dataset_2D_fib25_Train(Dataset):
@@ -75,9 +371,9 @@ class Dataset_2D_fib25_Train(Dataset):
                         self.images.append(raw[:, :, n])
                         self.masks.append(labels[:, :, n])
 
-        # self.data_pack = []
-        # for idx in tqdm(range(len(self.images))):
-        #     self.data_pack.append(self.prework(idx))
+        self.data_pack = []
+        for idx in tqdm.tqdm(range(len(self.images))):
+            self.data_pack.append(self.prework(idx))
 
     def __len__(self):
         return len(self.images)
@@ -334,7 +630,196 @@ class Dataset_2D_fib25_Train(Dataset):
             return raw, labels, point_map, mask, affinity
 
     def __getitem__(self, idx):
+        return self.data_pack[idx]
+
+
+class Dataset_2D_fib25_Test(Dataset):
+    def __init__(
+            self,
+            data_dir='./data/fib25/training/',  # 数据的路径
+            crop_size=None,  # 切割尺寸
+            padding_size=8):
+
+        self.crop_size = crop_size
+        self.padding_size = padding_size
+
+        self.images = list()
+        ##装载数据
+        # data_list = ['trvol-250-1.zarr', 'trvol-250-2.zarr', 'tstvol-520-1.zarr', 'tstvol-520-2.zarr']
+        # data_list = data_list * 8
+
+        # ##Debug
+        data_list = ['trvol-250-1.zarr']
+
+        for data_name in data_list:
+            zarr_path = os.path.join(data_dir, data_name)
+            f = zarr.open(zarr_path, mode='r')
+            volumes = f['volumes']
+            raw = volumes['raw']
+            print('data {}: raw shape={}'.format(data_name, raw.shape))
+            # print('raw unique={}, label unique= {}'.format(data_name, np.unique(raw), np.unique(labels)))
+
+            self.images.extend(raw)
+
+        self.data_pack = []
+        for idx in tqdm.tqdm(range(len(self.images))):
+            self.data_pack.append(self.prework(idx))
+
+    def __len__(self):
+        return len(self.images)
+
+    # function to erode label boundaries，即腐蚀边界
+    def erode(self, labels, iterations, border_value):
+
+        foreground = np.zeros_like(labels, dtype=bool)  # 和标签维度相同的全False矩阵
+
+        # loop through unique labels
+        for label in np.unique(labels):  # 遍历标签信息（切割块）中所有的连通域的值
+
+            # skip background
+            if label == 0:
+                continue
+
+            # mask to label
+            label_mask = labels == label  # 当前连通域对应的标签（背景为False，当前连通域为True）
+
+            # erode labels
+            eroded_mask = binary_erosion(
+                label_mask,
+                iterations=iterations,
+                border_value=border_value)  # 获得iterations轮腐蚀后的当前连通域的标签
+
+            # get foreground
+            foreground = np.logical_or(eroded_mask, foreground)  # 这个前景相当于所有连通域经过边界腐蚀后得到的前景，前景用True标出
+
+        # and background...
+        background = np.logical_not(foreground)
+
+        # set eroded pixels to zero
+        labels[background] = 0
+
+        return labels
+
+    # takes care of padding
+    def get_padding(self, crop_size, padding_size):
+
+        # quotient
+        q = int(crop_size / padding_size)
+
+        if crop_size % padding_size != 0:
+            padding = (padding_size * (q + 1))
+        else:
+            padding = crop_size
+
+        return padding
+
+        # sample augmentations (see https://albumentations.ai/docs/examples/example_kaggle_salt)
+
+    def augment_data(self, raw, padding):
+
+        transform = A.Compose([
+            A.Crop(
+                x_min=5, x_max=245,
+                y_min=5, y_max=245
+            ),
+            A.PadIfNeeded(
+                min_height=padding,
+                min_width=padding,
+                p=1,
+                border_mode=0),
+        ])  ## 数据增强
+
+        transformed = transform(image=raw)
+
+        raw = transformed['image']
+
+        return raw  ## 图像和标签的维度都是： padding * padding
+
+    # normalize raw data between 0 and 1
+    def normalize(self, data):
+        return (data - np.min(data)) / (np.max(data) - np.min(data)).astype(np.float32)
+
+    def generate_gaussian_matrix(self, Points_pos, Points_lab, H, W, theta=10):
+        if Points_pos == None:
+            total_matrix = np.ones((H, W))
+            return total_matrix
+
+        total_matrix = np.zeros((H, W))
+
+        record_list = list()
+        for n, (X, Y) in enumerate(Points_pos):
+            if (X, Y) not in record_list:
+                record_list.append((X, Y))
+            else:
+                continue
+
+            # 生成坐标网格
+            x, y = np.meshgrid(np.arange(W), np.arange(H))
+            pos = np.dstack((x, y))
+
+            # 以 (X, Y) 为中心，theta 为标准差生成高斯分布
+            rv = multivariate_normal(mean=[X, Y], cov=[[theta, 0], [0, theta]])
+
+            # 计算高斯分布在每个像素上的值
+            matrix = rv.pdf(pos)
+            ##normalize
+            matrix = matrix * (1 / np.max(matrix))
+
+            total_matrix = total_matrix + matrix * (Points_lab[n] * 2 - 1)
+            # total_matrix = total_matrix + matrix
+
+        if np.max(Points_lab) == 0:
+            total_matrix = total_matrix * 2 + 1
+
+        return total_matrix
+
+    # 展示一下求Affinity
+    def getAffinity(self, labels):
+        '''
+        labels为2维: 长*宽
+        Return: Affinity为3维, 2*长*宽,其中2对应了长(x)、宽(y)两个方向上的梯度
+        '''
+        label_shift = np.pad(labels, ((0, 1), (0, 1)), 'edge')
+
+        affinity_x = np.expand_dims(((labels - label_shift[1:, :-1]) != 0) + 0, axis=0)
+        affinity_y = np.expand_dims(((labels - label_shift[:-1, 1:]) != 0) + 0, axis=0)
+
+        affinity = np.concatenate([affinity_x, affinity_y], axis=0).astype('float32')
+
+        return affinity
+
+    def prework(self, idx):
+        raw = self.images[idx]  # 获得第idx张图像
+
+        # if self.split == 'val':
+        #     seed = 1000
+        #     np.random.seed(seed)
+        #     random.seed(seed)
+        # os.environ['PYTHONHASHSEED'] = str(seed)
+
+        raw = self.normalize(raw)  # 所有像素值归一化
+
+        # relabel connected components
+        # labels = label(labels).astype(np.uint16)  # 读取通道0的标签信息，并设置好连通域
+        # labels = labels.astype(np.uint16)  # 读取通道0的标签信息，并设置好连通域
+
+        padding = self.get_padding(self.crop_size, self.padding_size)  # padding_size的整数倍，>= crop_size
+        raw = self.augment_data(raw, padding)
+
+        raw = np.expand_dims(raw, axis=0)  # 1* 图像维度
+
+        point_map = torch.ones(raw.shape, dtype=torch.float32).squeeze()
+
+        return raw, point_map
+
+    def __getitem__(self, idx):
         return self.prework(idx)
+
+
+def collate_fn_2D_fib25_Test(batch):
+    raw = np.array([item[0] for item in batch]).astype(np.float32)
+    point_map = np.array([item[1] for item in batch]).astype(np.float32)
+    return raw, point_map
 
 
 def collate_fn_2D_fib25_Train(batch):

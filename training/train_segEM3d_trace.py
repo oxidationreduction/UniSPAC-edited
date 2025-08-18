@@ -20,7 +20,7 @@ from utils.dataloader_ninanjie import Dataset_3D_fib25_Train,collate_fn_3D_fib25
 
 ## CUDA_VISIBLE_DEVICES=0 python main_segEM_3d_train_zebrafinch.py &
 
-# WEIGHT_LOSS3 = 10
+# WEIGHT_LOSS_AFFINITY = 10
 
 
 
@@ -260,7 +260,7 @@ if __name__ == '__main__':
     learning_rate = 1e-4
     batch_size = 8
     # Save_Name = 'segEM3d(hemi+fib25+cremi)'
-    # Save_Name = 'segEM3d(hemi+fib25)faster_wloss3({})'.format(WEIGHT_LOSS3)
+    # Save_Name = 'segEM3d(hemi+fib25)faster_wloss3({})'.format(WEIGHT_LOSS_AFFINITY)
     Save_Name = 'segEM3d_trace(fib25)'
 
     set_seed()

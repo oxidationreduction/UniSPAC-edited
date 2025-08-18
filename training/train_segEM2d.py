@@ -17,7 +17,7 @@ from utils.dataloader_hemi_better import Dataset_2D_hemi_Train, collate_fn_2D_he
 
 ## CUDA_VISIBLE_DEVICES=0 python main_segEM_2d_train_zebrafinch.py &
 
-# WEIGHT_LOSS3 = 100
+# WEIGHT_LOSS_AFFINITY = 100
 
 def set_seed(seed=1998):
     random.seed(seed)
@@ -141,9 +141,9 @@ def model_step(model, optimizer, input_image, input_prompt, gt_binary_mask, gt_a
     Diceloss_fn = DiceLoss().to(device)
     loss2 = Diceloss_fn(1 - y_mask.squeeze(), 1 - gt_binary_mask.squeeze())
 
-    # loss3 = torch.sum(y_mask * gt_affinity)/torch.sum(gt_affinity)
+    # loss3 = torch.sum(y_pred * gt_affinity)/torch.sum(gt_affinity)
 
-    # loss = loss1 + loss2 + loss3 * WEIGHT_LOSS3
+    # loss = loss1 + loss2 + loss3 * WEIGHT_LOSS_AFFINITY
     loss = loss1 + loss2
 
     # backward if training mode

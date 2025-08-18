@@ -182,14 +182,14 @@ if __name__ == '__main__':
 
     ###创建模型
     # set device
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
 
     model = segEM2d()
     #多卡训练
     # 一机多卡设置
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1' #设置所有可以使用的显卡，共计四块
-    device_ids = [0,1] #选中显卡
+    os.environ['CUDA_VISIBLE_DEVICES'] = '2,3,4' #设置所有可以使用的显卡，共计四块
+    device_ids = [2,3,4] #选中显卡
     model = nn.DataParallel(model.cuda(), device_ids=device_ids, output_device=device_ids[0])#并行使用两块
     # model = torch.nn.DataParallel(model)  # 默认使用所有的device_ids
 
@@ -213,7 +213,6 @@ if __name__ == '__main__':
         joblib.dump(val_dataset_2, os.path.join(fib25_data, 'fib25_val.joblib'))
 
     print(np.unique(train_dataset_2.flatten()))
-    sys.exit(0)
 
     train_dataset = train_dataset_2
     val_dataset = val_dataset_2

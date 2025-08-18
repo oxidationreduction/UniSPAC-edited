@@ -195,7 +195,7 @@ class MergeTree(DiGraph):
         return self.node[u]['score']
 
     def find_merge_check(self, u, v):
-        '''Check results using old algorithm without Cython'''
+        '''Check metrics using old algorithm without Cython'''
 
         if not self.has_node(u) or not self.has_node(v):
             return None

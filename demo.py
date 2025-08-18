@@ -358,7 +358,7 @@ class ImageViewer(QMainWindow):
 
         raw = torch.tensor(raw_slice0, dtype=torch.float32).unsqueeze(0).unsqueeze(1).to(self.device)
         y_mask, y_lsds, y_affinity = self.segNeuro2d_model(raw, self.point_map)
-        # y_mask,y_affinity = self.segNeuro2d_model(raw,self.point_map)
+        # y_pred,y_affinity = self.segNeuro2d_model(raw,self.point_map)
         y_mask = (y_mask > 0.5) + 0
         segmentation = label((y_mask.squeeze().detach().cpu().numpy())[:, :])
         segmentation_color = self.create_lut(segmentation)
@@ -404,7 +404,7 @@ class ImageViewer(QMainWindow):
         print("raw shape = {}".format(raw.shape))
         print("self.point_map shape = {}".format(self.point_map.shape))
         y_mask, _, _, _ = self.segNeuro3d_model(raw, self.point_map)
-        # y_mask,_,_ =  self.segNeuro3d_model(raw,self.point_map)
+        # y_pred,_,_ =  self.segNeuro3d_model(raw,self.point_map)
         y_mask = (y_mask > 0.5) + 0
         y_mask = y_mask.squeeze().detach().cpu().numpy().transpose(2, 0, 1)
         segmentation = label(y_mask)

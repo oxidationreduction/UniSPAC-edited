@@ -18,7 +18,7 @@ from utils.dataloader_hemi_better import Dataset_2D_hemi_Train, collate_fn_2D_he
 
 ## CUDA_VISIBLE_DEVICES=0 python main_segEM_2d_train_zebrafinch.py &
 
-# WEIGHT_LOSS3 = 100
+# WEIGHT_LOSS_AFFINITY = 100
 
 def set_seed(seed=1998):
     random.seed(seed)
@@ -80,7 +80,8 @@ class segEM2d(torch.nn.Module):
         ##For affinity prediction
         self.model_affinity = ACRLSD()
         # model_path = './output/checkpoints/ACRLSD_2D(hemi+fib25+cremi)_Best_in_val.model' 
-        model_path = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/output/checkpoints/ACRLSD_2D(ninanjie)_Best_in_val.model'
+        model_path = ('/home/liuhongyu2024/Documents/UniSPAC-edited/'
+                      'output/checkpoints/ACRLSD_2D(ninanjie)_Best_in_val.model')
         weights = torch.load(model_path, map_location=torch.device('cpu'))
         self.model_affinity.load_state_dict(weights)
         for param in self.model_affinity.parameters():
@@ -142,9 +143,9 @@ def model_step(model, optimizer, input_image, input_prompt, gt_binary_mask, gt_a
     Diceloss_fn = DiceLoss().to(device)
     loss2 = Diceloss_fn(1 - y_mask.squeeze(), 1 - gt_binary_mask.squeeze())
 
-    # loss3 = torch.sum(y_mask * gt_affinity)/torch.sum(gt_affinity)
+    # loss3 = torch.sum(y_pred * gt_affinity)/torch.sum(gt_affinity)
 
-    # loss = loss1 + loss2 + loss3 * WEIGHT_LOSS3
+    # loss = loss1 + loss2 + loss3 * WEIGHT_LOSS_AFFINITY
     loss = loss1 + loss2
 
     # backward if training mode
@@ -183,8 +184,8 @@ if __name__ == '__main__':
     model = segEM2d()
     ##多卡训练
     # 一机多卡设置
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2'#设置所有可以使用的显卡，共计四块
-    device_ids = [0,1,2]#选中显卡
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,4'#设置所有可以使用的显卡，共计四块
+    device_ids = [0,1,4]#选中显卡
     torch.cuda.set_device(device_ids[0])
     model = nn.DataParallel(model.cuda(), device_ids=device_ids, output_device=device)
     # model = torch.nn.DataParallel(model)  # 默认使用所有的device_ids
@@ -194,12 +195,9 @@ if __name__ == '__main__':
     ##装载数据
     ninanjie_data = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie/fourth'
     ninanjie_save = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie-save'
-    train_dataset_1 = load_dataset('ninanjie-4_train.joblib', 'train')
-    val_dataset_1 = load_dataset('ninanjie-4_val.joblib', 'val')
 
-
-    train_dataset = train_dataset_1
-    val_dataset = val_dataset_1
+    train_dataset, val_dataset = load_dataset('first', require_xz_yz=True, from_temp=True,
+                                              crop_xyz=[3, 3, 2], chunk_position=[1, 1, 0])
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=14, pin_memory=True,
                               drop_last=True, collate_fn=collate_fn_2D_hemi_Train)

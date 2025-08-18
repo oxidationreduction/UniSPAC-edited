@@ -11,7 +11,7 @@ from tqdm.auto import tqdm
 import logging
 # from torch.utils.tensorboard import SummaryWriter
 from models.unet3d import UNet3d
-from utils.dataloader_ninanjie import load_dataset, collate_fn_3D_ninanjie_Train
+from utils.dataloader_ninanjie import load_train_dataset, collate_fn_3D_ninanjie_Train
 
 
 # from utils.dataloader_cremi import Dataset_3D_cremi_Train,collate_fn_3D_cremi_Train
@@ -82,7 +82,7 @@ def model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
         optimizer.zero_grad()
         
     # forward
-    lsd_logits,affinity_logits = model(raw)
+    lsd_logits, affinity_logits = model(raw)
 
     loss_value = loss_fn(lsd_logits, gt_lsds) + loss_fn(affinity_logits, gt_affinity)
     
@@ -104,76 +104,85 @@ def model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
     return loss_value, outputs
 
 
+def weighted_model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation, train_step=True):
+    # zero gradients if training
+    if train_step:
+        optimizer.zero_grad()
+
+    # forward
+    lsd_logits, affinity_logits = model(raw)
+
+    loss_value = loss_fn(lsd_logits, gt_lsds) + loss_fn(affinity_logits, gt_affinity)
+
+    # backward if training mode
+    if train_step:
+        loss_value.backward()
+        optimizer.step()
+
+    lsd_output = activation(lsd_logits)
+    affinity_output = activation(affinity_logits)
+
+    outputs = {
+        'pred_lsds': lsd_output,
+        'lsds_logits': lsd_logits,
+        'pred_affinity': affinity_output,
+        'affinity_logits': affinity_logits,
+    }
+
+    return loss_value, outputs
+
 
 if __name__ == '__main__':
     ##设置超参数
     training_epochs = 10000
     learning_rate = 1e-4
-    batch_size = 4
+    batch_size = 1
     # Save_Name = 'ACRLSD_3D(hemi+fib25+cremi)'
     # Save_Name = 'ACRLSD_3D(ninanjie)'
 
     set_seed()
 
-    ###创建模型
-    # set device
+    os.environ['CUDA_VISIBLE_DEVICES'] = '4,1,3'
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    # torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = True
+    gpus = [i for i in range(len(os.environ['CUDA_VISIBLE_DEVICES'].split(',')))]
 
-    model = ACRLSD_3d()
-    
-    ##单卡
-    # model = model.to(device)
-    
-    ##多卡训练
-    ##一机多卡设置
-    os.environ['CUDA_VISIBLE_DEVICES'] = '1,2'
-    gpus = [int(i) for i in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]#选中显卡
-    torch.cuda.set_device('cuda:{}'.format(gpus[0]))
+    model = ACRLSD_3d().to(device)
     model = nn.DataParallel(model.cuda(), device_ids=gpus, output_device=gpus[0])
     Save_Name = 'ACRLSD_3D(ninanjie)'
 
+    dataset_names = ['best_truth_3d']
+    crop_xyz = [4, 3, 1]
+    train_dataset, val_dataset = [], []
+    for dataset_name in dataset_names:
+        for i in range(crop_xyz[0]-1):
+            for j in range(crop_xyz[1]):
+                for k in range(crop_xyz[2]):
+                    _train, _val = load_train_dataset(dataset_name, raw_dir='raw_2', label_dir='truth_label_2', from_temp=True,
+                                                      crop_size=320, crop_xyz=crop_xyz, chunk_position=[i, j, k])
+                    train_dataset.append(_train)
+                    val_dataset.append(_val)
+    train_dataset, val_dataset = ConcatDataset(train_dataset), ConcatDataset(val_dataset)
 
-    ##装载数据
-    # train_dataset_1 = Dataset_3D_hemi_Train(data_dir='./data/funke/hemi/training/', split='train', crop_size=128, num_slices=8, require_lsd=True,require_xz_yz=True)
-    # val_dataset_1 = Dataset_3D_hemi_Train(data_dir='./data/funke/hemi/training/', split='val', crop_size=128, num_slices=8, require_lsd=True,require_xz_yz=True)
-    #
-    # train_dataset_2 = Dataset_3D_fib25_Train(data_dir='./data/funke/fib25/training/', split='train', crop_size=128, num_slices=8, require_lsd=True,require_xz_yz=True)
-    # val_dataset_2 = Dataset_3D_fib25_Train(data_dir='./data/funke/fib25/training/', split='val', crop_size=128, num_slices=8, require_lsd=True,require_xz_yz=True)
-
-    ninanjie_data = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie/'
-    ninanjie_save = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie-save'
-    train_dataset_2 = load_dataset('ninanjie-4_3d_train.joblib', 'train', require_xz_yz=False)
-    val_dataset_2 = load_dataset('ninanjie-4_3d_val.joblib', 'val', require_xz_yz=False)
-
-    # fib25_data = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/fib25'
-    # if os.path.exists(os.path.join(fib25_data, 'fib25_3d_train.joblib')):
-    #     print("Load data from disk...")
-    #     train_dataset_2 = joblib.load(os.path.join(fib25_data, 'fib25_3d_train.joblib'))
-    #     val_dataset_2 = joblib.load(os.path.join(fib25_data, 'fib25_3d_val.joblib'))
-    # else:
-    #     train_dataset_2 = Dataset_3D_fib25_Train(data_dir='./data/fib25/training/', split='train', crop_size=128,
-    #                                              num_slices=8, require_lsd=True,
-    #                                              require_xz_yz=True)
-    #     val_dataset_2 = Dataset_3D_fib25_Train(data_dir='./data/fib25/training/', split='val', crop_size=128,
-    #                                            num_slices=8, require_lsd=True,
-    #                                            require_xz_yz=True)
-    #     joblib.dump(train_dataset_2, os.path.join(fib25_data, 'fib25_3d_train.joblib'))
-    #     joblib.dump(val_dataset_2, os.path.join(fib25_data, 'fib25_3d_val.joblib'))
-
-    # train_dataset_3 = Dataset_3D_cremi_Train(data_dir='../data/CREMI/', split='train', crop_size=128, num_slices=8, require_lsd=True)
-    # val_dataset_3 = Dataset_3D_cremi_Train(data_dir='../data/CREMI/', split='val', crop_size=128, num_slices=8, require_lsd=True)
-    
-    # train_dataset = ConcatDataset([train_dataset_1, train_dataset_2])
-    # val_dataset   = ConcatDataset([val_dataset_1, val_dataset_2])
-    
-    train_dataset = train_dataset_2
-    val_dataset = val_dataset_2
-    
-    train_loader = DataLoader(train_dataset,batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True,
-                              drop_last=True,collate_fn=collate_fn_3D_ninanjie_Train)
-    val_loader = DataLoader(val_dataset,batch_size=batch_size//2, shuffle=False, num_workers=8, pin_memory=True,
+    train_loader = DataLoader(train_dataset,batch_size=batch_size, shuffle=True, num_workers=28, pin_memory=True,
+                              drop_last=False,collate_fn=collate_fn_3D_ninanjie_Train)
+    val_loader = DataLoader(val_dataset,batch_size=batch_size, shuffle=False, num_workers=28, pin_memory=True,
                             collate_fn=collate_fn_3D_ninanjie_Train)
+
+    def load_data_to_device(loader):
+        res = []
+        for raw, labels, mask_3D, gt_affinity, point_map, gt_lsds in loader:
+            raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
+            # labels = torch.as_tensor(labels, dtype=torch.int32, device=device)
+            # mask_3D = torch.as_tensor(mask_3D, dtype=torch.uint8, device=device)
+            # point_map = torch.as_tensor(point_map, dtype=torch.float, device=device)
+            gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
+            gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
+                                          device=device)  # (batch, 2, height, width)
+            res.append((raw, labels, mask_3D, gt_affinity, point_map, gt_lsds))
+        return res
+
+    train_loader, val_loader = load_data_to_device(train_loader), load_data_to_device(val_loader)
 
     ##创建log日志
     logger = logging.getLogger()
@@ -203,7 +212,7 @@ if __name__ == '__main__':
     # set optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     # set activation
-    activation = torch.nn.Sigmoid()
+    activation = torch.nn.Sigmoid().to(device)
     # set loss function
     loss_fn = torch.nn.MSELoss().to(device)
 
@@ -216,24 +225,21 @@ if __name__ == '__main__':
     early_stop_count = 100
     no_improve_count = 0
     with tqdm(total=training_epochs) as pbar:
+        progress_desc, train_desc, val_desc = '', '', ''
         while epoch < training_epochs:
-            pbar.set_description(f"Best epoch: {Best_epoch}, loss: {Best_val_loss:.2f}")
             ###################Train###################
             model.train()
             # reset data loader to get random augmentations
             np.random.seed()
             random.seed()
             tmp_loader = iter(train_loader)
-            for raw, labels, mask_3D, gt_affinity, point_map,gt_lsds in tqdm(tmp_loader, leave=False):
-                ##Get Tensor
-                raw = torch.as_tensor(raw,dtype=torch.float, device= device) #(batch, 1, height, width)
-                gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device) #(batch, 6, height, width)
-                gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float, device=device) #(batch, 2, height, width)
-                                            
-                loss_value, pred = model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation)
-            epoch += 1
-            pbar.update(1)
-
+            count, total = 0, len(tmp_loader)
+            for raw, labels, mask_3D, gt_affinity, point_map, gt_lsds in tmp_loader:
+                model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation)
+                count += 1
+                progress_desc = f"Train {count}/{total}, "
+                train_desc = f"loss: {Best_val_loss:.4f}, "
+                pbar.set_description(progress_desc + train_desc + val_desc)
 
             ###################Validate###################
             model.eval()
@@ -243,15 +249,16 @@ if __name__ == '__main__':
             random.seed(seed)
             tmp_val_loader = iter(val_loader)
             acc_loss = []
-            for raw, labels, mask_3D, gt_affinity, point_map,gt_lsds in tmp_val_loader:
-                raw = torch.as_tensor(raw,dtype=torch.float, device= device) #(batch, 1, height, width)
-                gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device) #(batch, 6, height, width)
-                gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float, device=device) #(batch, 2, height, width)
+            count, total = 0, len(tmp_val_loader)
+            for raw, labels, mask_3D, gt_affinity, point_map, gt_lsds in tmp_val_loader:
                 with torch.no_grad():
                     loss_value, _ = model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation, train_step=False)
-                acc_loss.append(loss_value.cpu().detach().numpy())
-            val_loss = np.mean(acc_loss)
-            
+                count += 1
+                acc_loss.append(loss_value)
+                progress_desc = f"Val {count}/{total}, "
+                pbar.set_description(progress_desc + train_desc + val_desc)
+
+            val_loss = torch.stack([loss_value.cpu() for loss_value in acc_loss]).mean().item()
 
             ###################Compare###################
             if Best_val_loss > val_loss:
@@ -260,8 +267,10 @@ if __name__ == '__main__':
                 torch.save(model.module.state_dict(),'./output/checkpoints/{}_Best_in_val.model'.format(Save_Name))
                 no_improve_count = 0
             else:
-                no_improve_count = no_improve_count + 1
+                no_improve_count += 1
 
+            val_desc = f'best epoch {Best_epoch}'
+            pbar.update(1)
 
             ##Record
             logging.info("Epoch {}: val_loss = {:.6f},with best val_loss = {:.6f} in epoch {}".format(
@@ -269,9 +278,6 @@ if __name__ == '__main__':
             # writer.add_scalar('val_loss', val_loss, epoch)
         
             ##Early stop
-            if no_improve_count==early_stop_count:
+            if no_improve_count==early_stop_count and epoch > 100:
                 logging.info("Early stop!")
                 break
-
-
-

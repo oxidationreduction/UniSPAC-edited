@@ -114,23 +114,13 @@ if __name__ == '__main__':
 
     set_seed()
 
-    ###创建模型
-    # set device
+    os.environ['CUDA_VISIBLE_DEVICES'] = '2,4,5'
+    gpus = [i for i in range(len(os.environ['CUDA_VISIBLE_DEVICES'].split(',')))]
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
-
-    model = ACRLSD_3d()
-    
-    ##单卡
-    model = model.to(device)
-    
-    ##多卡训练
-    ##一机多卡设置
-    # os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2'
-    # gpus = [0,1,2]#选中显卡
-    # torch.cuda.set_device('cuda:{}'.format(gpus[0]))
-    # model = nn.DataParallel(model.cuda(), device_ids=gpus, output_device=gpus[0])
-    # Save_Name = 'ACRLSD_3D(fib25)'
+    model = ACRLSD_3d().to(device)
+    model = nn.DataParallel(model.cuda(), device_ids=gpus, output_device=gpus[0])
+    Save_Name = 'ACRLSD_3D(fib25)'
 
 
     ##装载数据

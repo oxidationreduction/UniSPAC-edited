@@ -302,7 +302,7 @@ class segEM3d(torch.nn.Module):
         ##2D slice mask prediction
         self.model_mask_2d = segEM2d()
         # model_path = './output/checkpoints/segEM_2d(hemi+fib25+cremi)_Best_in_val.model' 
-        # model_path = './output/checkpoints/segEM_2d(hemi+fib25)faster_wloss3({})_Best_in_val.model'.format(WEIGHT_LOSS3)
+        # model_path = './output/checkpoints/segEM_2d(hemi+fib25)faster_wloss3({})_Best_in_val.model'.format(WEIGHT_LOSS_AFFINITY)
         model_path = './output/checkpoints/segEM2d(hemi+fib25)_Best_in_val.model'
         weights = torch.load(model_path,map_location=torch.device('cpu'))
         self.model_mask_2d.load_state_dict(weights)

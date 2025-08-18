@@ -173,6 +173,6 @@ def agglomerate_in_block(
 
     logger.info("merged %d edges", num_merged)
 
-    # write back results (only within write_roi)
+    # write back metrics (only within write_roi)
     logger.debug("writing to DB...")
     rag.write_edges(block.write_roi)
