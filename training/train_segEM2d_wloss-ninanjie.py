@@ -354,6 +354,7 @@ if __name__ == '__main__':
                 with torch.no_grad():
                     loss_value, y_mask = weighted_model_step(model, optimizer, raw, point_map, mask, gt_affinity, activation,
                                                train_step=False)
+                    acc_loss.append(loss_value)
                     binary_y_mask = ((np.asarray(y_mask.detach().cpu()) > 0.5) + 0).flatten()
                     binary_gt_seg = ((np.asarray(labels) > 0.0) + 0).flatten()
 
@@ -369,7 +370,6 @@ if __name__ == '__main__':
             acc, prec, recall, f1 = metrics[:]
             val_desc = f'acc: {acc:.3f}, prec: {prec:.3f}, recall: {recall:.3f}, f1: {f1:.3f}, VOI: {voi_val:.5f}'
             analysis.loc[len(analysis)] = [acc, prec, recall, f1, voi_val]
-            acc_loss.append(loss_value)
             # val_loss = np.mean(np.array([loss_value.cpu().numpy() for loss_value in acc_loss]))
             val_loss = torch.stack([loss_value.cpu() for loss_value in acc_loss]).mean().item()
 

@@ -1,14 +1,19 @@
-import math
-
-import joblib
-import numpy as np
+import gc
+import itertools
+import logging
+import multiprocessing
 import os
 import random
+
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader,ConcatDataset
+from skimage.metrics import variation_of_information
+from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
-import logging
+
 # from torch.utils.tensorboard import SummaryWriter
 from models.unet3d import UNet3d
 from utils.dataloader_ninanjie import load_train_dataset, collate_fn_3D_ninanjie_Train
@@ -97,7 +102,7 @@ def model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
     outputs = {
         'pred_lsds': lsd_output,
         'lsds_logits': lsd_logits,
-        'pred_affinity': affinity_output,
+        'pred_affinity': (affinity_output > 0.5) + 0,
         'affinity_logits': affinity_logits,
     }
     
@@ -131,43 +136,66 @@ def weighted_model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, ac
 
     return loss_value, outputs
 
+def _load_datasets(dataset_name_, crop_size_, crop_xyz_, a, b, c):
+    return load_train_dataset(dataset_name_, raw_dir='raw_2', label_dir='truth_label_2', from_temp=True,
+                           crop_size=crop_size_, crop_xyz=crop_xyz_, chunk_position=[a, b, c])
 
 if __name__ == '__main__':
     ##设置超参数
     training_epochs = 10000
     learning_rate = 1e-4
-    batch_size = 1
+    batch_size = 10
     # Save_Name = 'ACRLSD_3D(hemi+fib25+cremi)'
     # Save_Name = 'ACRLSD_3D(ninanjie)'
 
     set_seed()
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = '4,1,3'
+    os.environ['CUDA_VISIBLE_DEVICES'] = '4,1'
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
     gpus = [i for i in range(len(os.environ['CUDA_VISIBLE_DEVICES'].split(',')))]
 
     model = ACRLSD_3d().to(device)
     model = nn.DataParallel(model.cuda(), device_ids=gpus, output_device=gpus[0])
-    Save_Name = 'ACRLSD_3D(ninanjie)'
 
     dataset_names = ['best_truth_3d']
+    crop_size = 384
     crop_xyz = [4, 3, 1]
     train_dataset, val_dataset = [], []
-    for dataset_name in dataset_names:
-        for i in range(crop_xyz[0]-1):
-            for j in range(crop_xyz[1]):
-                for k in range(crop_xyz[2]):
-                    _train, _val = load_train_dataset(dataset_name, raw_dir='raw_2', label_dir='truth_label_2', from_temp=True,
-                                                      crop_size=320, crop_xyz=crop_xyz, chunk_position=[i, j, k])
-                    train_dataset.append(_train)
-                    val_dataset.append(_val)
+
+    multiprocessing.set_start_method('spawn', force=True)
+    with multiprocessing.Pool(14) as pool:
+        results = []
+        for dataset_name in dataset_names:
+            for i, j, k in itertools.product(
+                    range(crop_xyz[0] - 1),
+                    range(crop_xyz[1]),
+                    range(crop_xyz[2])
+            ):
+                results.append(pool.apply_async(_load_datasets, args=(dataset_name, crop_size, crop_xyz, i, j, k)))
+        for result_ in results:
+            train_, val_ = result_.get()
+            train_dataset.append(train_)
+            val_dataset.append(val_)
+
+    # for dataset_name, i, j, k in itertools.product(
+    #         dataset_names,
+    #         range(crop_xyz[0] - 1),
+    #         range(crop_xyz[1]),
+    #         range(crop_xyz[2])
+    # ):
+    #     train_, val_ = _load_datasets(dataset_name, crop_size, crop_xyz, i, j, k)
+    #     train_dataset.append(train_)
+    #     val_dataset.append(val_)
+
     train_dataset, val_dataset = ConcatDataset(train_dataset), ConcatDataset(val_dataset)
 
-    train_loader = DataLoader(train_dataset,batch_size=batch_size, shuffle=True, num_workers=28, pin_memory=True,
-                              drop_last=False,collate_fn=collate_fn_3D_ninanjie_Train)
-    val_loader = DataLoader(val_dataset,batch_size=batch_size, shuffle=False, num_workers=28, pin_memory=True,
+    train_loader = DataLoader(train_dataset,batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False,
+                              drop_last=True,collate_fn=collate_fn_3D_ninanjie_Train)
+    val_loader = DataLoader(val_dataset,batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False,
                             collate_fn=collate_fn_3D_ninanjie_Train)
+
+    Save_Name = f'ACRLSD_3D(ninanjie)_{crop_size}'
 
     def load_data_to_device(loader):
         res = []
@@ -182,21 +210,22 @@ if __name__ == '__main__':
             res.append((raw, labels, mask_3D, gt_affinity, point_map, gt_lsds))
         return res
 
-    train_loader, val_loader = load_data_to_device(train_loader), load_data_to_device(val_loader)
+    # train_loader, val_loader = load_data_to_device(train_loader), load_data_to_device(val_loader)
 
     ##创建log日志
     logger = logging.getLogger()
+    logger.handlers.clear()
     logger.setLevel(logging.INFO)
-    logfile = './output/log/log_{}.txt'.format(Save_Name)
-    fh = logging.FileHandler(logfile, mode='a', delay=False)
+    log_dir = f'./output/log/{Save_Name}'
+    os.makedirs(log_dir, exist_ok=True)
+    logfile = '{}/log_{}.txt'.format(log_dir, Save_Name)
+    csvfile = '{}/log_{}.csv'.format(log_dir, Save_Name)
+    writer = SummaryWriter(log_dir=log_dir)
+    fh = logging.FileHandler(logfile, mode='a')
     fh.setLevel(logging.DEBUG)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.WARNING)
     formatter = logging.Formatter("%(asctime)s - %(filename)s[line:%(lineno)d] - %(levelname)s: %(message)s")
     fh.setFormatter(formatter)
-    ch.setFormatter(formatter)
     logger.addHandler(fh)
-    logger.addHandler(ch)
 
     logging.info(f'''Starting training:
     training_epochs:  {training_epochs}
@@ -225,6 +254,7 @@ if __name__ == '__main__':
     early_stop_count = 100
     no_improve_count = 0
     with tqdm(total=training_epochs) as pbar:
+        analysis = pd.DataFrame(columns=['loss', 'voi'])
         progress_desc, train_desc, val_desc = '', '', ''
         while epoch < training_epochs:
             ###################Train###################
@@ -235,7 +265,15 @@ if __name__ == '__main__':
             tmp_loader = iter(train_loader)
             count, total = 0, len(tmp_loader)
             for raw, labels, mask_3D, gt_affinity, point_map, gt_lsds in tmp_loader:
+                # _raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
+                # # labels = torch.as_tensor(labels, dtype=torch.int32, device=device)
+                # # mask_3D = torch.as_tensor(mask_3D, dtype=torch.uint8, device=device)
+                # # point_map = torch.as_tensor(point_map, dtype=torch.float, device=device)
+                # _gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
+                # _gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float, device=device)
+                # model_step(model, loss_fn, optimizer, _raw, _gt_lsds, _gt_affinity, activation)
                 model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation)
+
                 count += 1
                 progress_desc = f"Train {count}/{total}, "
                 train_desc = f"loss: {Best_val_loss:.4f}, "
@@ -249,35 +287,56 @@ if __name__ == '__main__':
             random.seed(seed)
             tmp_val_loader = iter(val_loader)
             acc_loss = []
+            voi_val = 0
             count, total = 0, len(tmp_val_loader)
             for raw, labels, mask_3D, gt_affinity, point_map, gt_lsds in tmp_val_loader:
+                # _raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
+                # # labels = torch.as_tensor(labels, dtype=torch.int32, device=device)
+                # # mask_3D = torch.as_tensor(mask_3D, dtype=torch.uint8, device=device)
+                # # point_map = torch.as_tensor(point_map, dtype=torch.float, device=device)
+                # _gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
+                # _gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float, device=device)
+
                 with torch.no_grad():
-                    loss_value, _ = model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation, train_step=False)
+                    # loss_value, outputs = model_step(model, loss_fn, optimizer, _raw, _gt_lsds, _gt_affinity,
+                    #                                  activation, train_step=False)
+                    loss_value, outputs = model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity,
+                                                     activation, train_step=False)
+
+                binary_gt_affinity = np.asarray(gt_affinity.cpu(), dtype=np.uint8).flatten()
+                binary_y_affinity = np.asarray(outputs['pred_affinity'].cpu(), dtype=np.uint8).flatten()
+                voi_val += np.sum(variation_of_information(binary_gt_affinity, binary_y_affinity))
                 count += 1
                 acc_loss.append(loss_value)
                 progress_desc = f"Val {count}/{total}, "
                 pbar.set_description(progress_desc + train_desc + val_desc)
 
             val_loss = torch.stack([loss_value.cpu() for loss_value in acc_loss]).mean().item()
-
+            voi_val /= (total + 0.0)
+            analysis.loc[len(analysis)] = [val_loss, voi_val]
             ###################Compare###################
             if Best_val_loss > val_loss:
                 Best_val_loss = val_loss
                 Best_epoch = epoch
-                torch.save(model.module.state_dict(),'./output/checkpoints/{}_Best_in_val.model'.format(Save_Name))
+                torch.save(model.module.state_dict(),'{}/{}_Best_in_val.model'.format(log_dir, Save_Name))
                 no_improve_count = 0
             else:
                 no_improve_count += 1
 
-            val_desc = f'best epoch {Best_epoch}'
+            val_desc = f'VOI: {voi_val:.4f}, best epoch {Best_epoch}'
             pbar.update(1)
+            epoch += 1
 
             ##Record
             logging.info("Epoch {}: val_loss = {:.6f},with best val_loss = {:.6f} in epoch {}".format(
                 epoch,val_loss,Best_val_loss,Best_epoch))
-            # writer.add_scalar('val_loss', val_loss, epoch)
+            writer.add_scalar('val_loss', val_loss, epoch)
+            writer.add_scalar('val_voi', voi_val, epoch)
+            analysis.to_csv(csvfile)
         
             ##Early stop
             if no_improve_count==early_stop_count and epoch > 100:
                 logging.info("Early stop!")
+                torch.save(model.module.state_dict(), '{}/{}_final.model'.format(log_dir, Save_Name))
+                writer.close()
                 break

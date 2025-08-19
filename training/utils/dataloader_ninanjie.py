@@ -31,7 +31,7 @@ def load_train_dataset(dataset_name: str, raw_dir=None, label_dir=None, from_tem
     temp_name = (f'{dataset_name}_{from_temp}_{require_lsd}_{require_xz_yz}_{crop_size}_'
                  f'{"".join((str(i) for i in crop_xyz))}_{"".join((str(i) for i in chunk_position))}_full')
 
-    DATASET = Dataset_3D_ninanjie_Train if '_3d' in dataset_name.lower() else Dataset_2D_ninanjie_Train
+    DATASET = Dataset_3D_ninanjie_Train_GPU if '_3d' in dataset_name.lower() else Dataset_2D_ninanjie_Train
     dataset_name = dataset_name.replace('_3d', '')
     if os.path.exists(os.path.join(ninanjie_save, temp_name)) and from_temp:
         print(f'load {dataset_name} from disk')
@@ -1443,18 +1443,24 @@ class Dataset_3D_ninanjie_Train(Dataset):
         z_start, z_end = chunk_position[2] * len(os.listdir(raw_dir)) // crop_xyz[2], \
                          (chunk_position[2] + 1) * len(os.listdir(raw_dir)) // crop_xyz[2]
 
-        multi_pool = Pool(os.cpu_count() >> 1)
-        results = []
+        # multi_pool = Pool(os.cpu_count() >> 1)
+        # results = []
+        # for image in os.listdir(raw_dir)[z_start:z_end]:
+        #     results.append(
+        #         multi_pool.apply_async(_add_image, args=(raw_dir, labels_dir, image, crop_xyz[:2], chunk_position[:2])))
+        # for result in results:
+        #     raw_img, label_img = result.get()
+        #     if raw_img and label_img:
+        #         raw.append(raw_img)
+        #         labels.append(label_img)
+        # multi_pool.close()
+        # multi_pool.join()
+
         for image in os.listdir(raw_dir)[z_start:z_end]:
-            results.append(
-                multi_pool.apply_async(_add_image, args=(raw_dir, labels_dir, image, crop_xyz[:2], chunk_position[:2])))
-        for result in results:
-            raw_img, label_img = result.get()
+            raw_img, label_img = _add_image(raw_dir, labels_dir, image, crop_xyz[:2], chunk_position[:2])
             if raw_img and label_img:
                 raw.append(raw_img)
                 labels.append(label_img)
-        multi_pool.close()
-        multi_pool.join()
 
         val_size = min(max(2, len(raw) // 5), 20)  # 20% samples as val_set. 20 samples max if total samples over 100.
         raw = np.array(raw)
@@ -1496,6 +1502,8 @@ class Dataset_3D_ninanjie_Train(Dataset):
             else:
                 invalid_count += 1
             pbar.set_description(f'preprocessing, {invalid_count} pics invalid')
+
+        # self.prework_for_all()
 
     def __len__(self):
         return len(self.idxs)
@@ -1666,8 +1674,384 @@ class Dataset_3D_ninanjie_Train(Dataset):
         else:
             return raw, labels, mask_3D, affinity, point_map
 
+    def prework_for_all(self):
+        raw = self.images
+        labels = self.masks
+        raw = raw.transpose(1, 2, 0)  # xyz
+        labels = labels.transpose(1, 2, 0)  # xyz
+
+        raw = self.normalize(raw)  # 所有像素值归一化
+
+        # relabel connected components
+        # labels = label(labels).astype(np.uint16)  # 读取通道0的标签信息，并设置好连通域
+        # labels = labels.astype(np.uint16)  # 读取通道0的标签信息，并设置好连通域
+
+        padding = self.get_padding(self.crop_size, self.padding_size)  # padding_size的整数倍，>= crop_size
+        raw, labels = self.augment_data(raw, labels, padding)
+
+        raw = np.expand_dims(raw, axis=0)  # 1* 图像维度
+
+        # if train/val, generate our gt labels
+        ## 非测试数据的话，进行一轮边界腐蚀
+        labels = self.erode(
+            labels,
+            iterations=1,  # 腐蚀的迭代次数
+            border_value=1)  # 边界值
+
+        affinity = self.getAffinity(labels)
+
+        if self.require_lsd:
+            lsds = local_shape_descriptor.get_local_shape_descriptors(
+                segmentation=labels,
+                sigma=(5,) * 3,
+                voxel_size=(1,) * 3)  ##获得lsd标签，维度为：10*图像维度
+
+            lsds = lsds.astype(np.float32)  # 10* 图像维度
+
+        mask_3D, Points_pos, Points_lab = self.get_Mask(labels)
+        point_map = self.generate_gaussian_matrix(Points_pos, Points_lab, self.crop_size, self.crop_size, theta=30)
+        # point_map = np.ones((self.crop_size, self.crop_size))
+
+        if self.require_lsd:
+            self.data_pack = (raw, labels, mask_3D, affinity, point_map, lsds)
+        else:
+            self.data_pack = (raw, labels, mask_3D, affinity, point_map)
+
     def __getitem__(self, idx):
         return self.data_pack[idx]
+        # return [mat[..., idx: idx + self.num_slices] if mat is not None else None
+        #         for mat in self.data_pack
+        #         ]
+
+    def get_item(self, idx):
+        return (mat[..., idx : idx+self.num_slices] if mat else None
+                for mat in self.data_pack
+        )
+
+
+class Dataset_3D_ninanjie_Train_GPU(Dataset):
+    def __init__(
+            self,
+            data_dir='./data/ninanjie',
+            batch_num='first',
+            raw_dir=None,
+            label_dir=None,
+            split='train',
+            crop_size=None,
+            num_slices=8,
+            padding_size=8,
+            require_lsd=False,
+            crop_xyz=None,
+            chunk_position=None,
+            **kwargs):
+
+        if crop_xyz is None:
+            crop_xyz = [3, 3, 2]
+        if chunk_position is None:
+            chunk_position = [0, 0, 0]
+        self.split = split
+        self.crop_size = crop_size
+        self.num_slices = num_slices
+        self.padding_size = padding_size
+        self.require_lsd = require_lsd
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # 加载原始数据
+        self.images = []
+        self.masks = []
+        self.idxs = []
+
+        raw_dir = os.path.join(data_dir, batch_num, raw_dir if raw_dir else 'raw')
+        labels_dir = os.path.join(data_dir, batch_num, label_dir if label_dir else 'label')
+
+        # 计算z轴切割范围
+        z_files = sorted(os.listdir(raw_dir))
+        z_start = chunk_position[2] * len(z_files) // crop_xyz[2]
+        z_end = (chunk_position[2] + 1) * len(z_files) // crop_xyz[2]
+        z_files = z_files[z_start:z_end]
+
+        # 多进程加载图像
+        with Pool(os.cpu_count() >> 1) as multi_pool:
+            results = []
+            for image in z_files:
+                results.append(
+                    multi_pool.apply_async(_add_image,
+                                           args=(raw_dir, labels_dir, image, crop_xyz[:2], chunk_position[:2])))
+
+            for result in results:
+                raw_img, label_img = result.get()
+                if raw_img is not None and label_img is not None:
+                    self.images.append(raw_img)
+                    self.masks.append(label_img)
+
+        # 转换为numpy数组并分割训练/验证集
+        self.images = np.asarray(self.images)  # 形状: (N, H, W)
+        self.masks = np.asarray(self.masks, dtype=np.int32)  # 形状: (N, H, W)
+        print(f'原始数据形状: {self.images.shape}, 标签形状: {self.masks.shape}')
+
+        # 分割训练/验证集
+        val_size = min(max(2, len(self.images) // 5), 20)
+        if split == 'train':
+            self.images = self.images[val_size:]
+            self.masks = self.masks[val_size:]
+        else:  # val
+            self.images = self.images[:val_size]
+            self.masks = self.masks[:val_size]
+
+        # 预处理并转移到显存
+        self._preprocess_and_move_to_gpu()
+
+        # 生成有效的切片索引（只保留有标注的切片）
+        self.idxs = [
+            idx for idx in range(self.images.shape[0] - self.num_slices + 1)
+            if np.any(self.masks[idx:idx + self.num_slices])
+        ]
+        if not self.idxs:
+            raise ValueError("没有有效的训练样本，请检查数据或调整num_slices")
+
+    def _preprocess_and_move_to_gpu(self):
+        """预处理数据并将其转移到GPU显存"""
+        pbar = tqdm.tqdm(total=7, leave=False)
+        # 转置为 (H, W, N) 并归一化
+        raw = self.images.transpose(1, 2, 0)  # (H, W, N)
+        raw = self.normalize(raw)
+        pbar.set_description("raw normalized")
+        pbar.update(1)
+
+        # 处理标签
+        labels = self.masks.transpose(1, 2, 0)  # (H, W, N)
+        labels = self.erode(labels, iterations=1, border_value=1)
+        pbar.set_description("label eroded")
+        pbar.update(1)
+
+        # 数据增强
+        padding = self.get_padding(self.crop_size, self.padding_size)
+        raw, labels = self.augment_data(raw, labels, padding)
+        pbar.set_description("raw & label augmented")
+        pbar.update(1)
+
+        # 预计算亲和力矩阵 (如果需要)
+        self.affinity = self._compute_affinity(labels)
+        self.affinity = torch.tensor(self.affinity, dtype=torch.float32, device=self.device)
+        pbar.set_description("affinity generated")
+        pbar.update(1)
+
+        # 预计算mask和点图
+        self.mask_3D, _, _ = self.get_Mask(labels)
+        self.mask_3D = torch.tensor(self.mask_3D, dtype=torch.uint8, device=self.device)
+
+        self.point_map = torch.tensor(
+            self.generate_gaussian_matrix(None, None, self.crop_size, self.crop_size, theta=30),
+            dtype=torch.float32, device=self.device
+        )
+        pbar.set_description("point_map generated")
+        pbar.update(1)
+
+        # 处理LSD特征 (如果需要)
+        self.lsds = None
+        if self.require_lsd:
+            lsds = local_shape_descriptor.get_local_shape_descriptors(
+                segmentation=labels,
+                sigma=(5,) * 3,
+                voxel_size=(1,) * 3
+            )
+            self.lsds = torch.tensor(lsds, dtype=torch.float32, device=self.device)
+        pbar.set_description("lsd created")
+        pbar.update(1)
+
+        # 转换为torch张量并转移到GPU
+        raw = torch.tensor(raw, dtype=torch.float32, device=self.device)
+        labels = torch.tensor(labels, dtype=torch.int32, device=self.device)
+        self.raw, self.labels = raw.unsqueeze(0), labels.unsqueeze(0)
+        pbar.set_description("raw & label to cuda")
+        pbar.update(1)
+        pbar.close()
+
+    def _compute_affinity(self, labels):
+        """预先计算亲和力矩阵"""
+        label_shift = np.pad(labels, ((0, 1), (0, 1), (0, 1)), 'edge')
+
+        affinity_x = np.expand_dims(((labels - label_shift[1:, :-1, :-1]) != 0) + 0, axis=0)
+        affinity_y = np.expand_dims(((labels - label_shift[:-1, 1:, :-1]) != 0) + 0, axis=0)
+        affinity_z = np.expand_dims(((labels - label_shift[:-1, :-1, 1:]) != 0) + 0, axis=0)
+
+        background = (labels == 0)
+        affinity_x[0][background] = 1
+        affinity_y[0][background] = 1
+        affinity_z[0][background] = 1
+
+        return np.concatenate([affinity_x, affinity_y, affinity_z], axis=0).astype('float32')
+
+    def __len__(self):
+        return len(self.idxs)
+
+    def __getitem__(self, idx):
+        """直接从显存切片获取数据，避免重复存储"""
+        start = self.idxs[idx]
+        end = start + self.num_slices
+
+        # 切片获取8层数据 (H, W, [start:end])
+        raw_slice = self.raw[..., start:end]
+
+        # 标签和其他数据同样切片
+        labels_slice = self.labels[..., start:end]
+        mask_slice = self.mask_3D[..., start:end]
+        affinity_slice = self.affinity[..., start:end]
+        point_map_slice = self.point_map
+
+        # 组装返回数据
+        result = [
+            raw_slice,
+            labels_slice,
+            mask_slice,
+            affinity_slice,
+            point_map_slice
+        ]
+
+        # 如果需要LSD特征
+        if self.require_lsd:
+            result.append(self.lsds[..., start:end])
+
+        return result
+
+    def augment_data(self, raw, mask, padding):
+
+        transform = A.Compose([
+            A.RandomCrop(
+                width=self.crop_size,
+                height=self.crop_size),  # 1. 随机切割成 crop_size * crop_size 的尺寸
+            A.PadIfNeeded(
+                min_height=padding,
+                min_width=padding,
+                p=1,
+                border_mode=0),
+            # 2. 填充成 padding * padding 的尺寸，border_mode=0似乎是常数填充（参考：https://wenku.csdn.net/answer/b124adffba28441daf7b260623a28d87）
+            A.HorizontalFlip(p=0.3),  # 3. 以0.3的概率进行水平翻转
+            A.VerticalFlip(p=0.3),  # 4. 以0.3的概率进行垂直翻转
+            A.RandomRotate90(p=0.3),  # 5. 以0.3的概率进行垂随机旋转90度
+            A.Transpose(p=0.3),  # 6. 以0.3的概率进行转置
+            A.RandomBrightnessContrast(p=0.3)  # 7. 以0.3的概率随机改变输入图像的亮度和对比度。
+        ])  ## 数据增强
+
+        transformed = transform(image=raw, mask=mask)
+
+        raw, mask = transformed['image'], transformed['mask']
+
+        return raw, mask  ## 图像和标签的维度都是： padding * padding
+
+    def augment_data_gpu(self, raw, mask, padding):
+        """GPU上的数据增强（完全匹配albumentations原功能）"""
+        # 原始数据形状: raw为(1, H, W, D), mask为(H, W, D)
+        # 1. 随机裁剪到crop_size（与A.RandomCrop一致）
+        raw, mask = raw.unsqueeze(0), mask.unsqueeze(0)
+        h, w = raw.shape[1], raw.shape[2]
+        if h > self.crop_size and w > self.crop_size:
+            # 随机生成裁剪起点
+            top = torch.randint(0, h - self.crop_size, (1,), device=self.device).item()
+            left = torch.randint(0, w - self.crop_size, (1,), device=self.device).item()
+            # 执行裁剪
+            raw = raw[:, top:top + self.crop_size, left:left + self.crop_size, :]
+            mask = mask[top:top + self.crop_size, left:left + self.crop_size, :]
+
+        # 2. 填充到padding大小（与A.PadIfNeeded一致）
+        current_h, current_w = raw.shape[1], raw.shape[2]
+        pad_h = max(0, padding - current_h)
+        pad_w = max(0, padding - current_w)
+
+        if pad_h > 0 or pad_w > 0:
+            # 计算上下左右填充量（与albumentations默认相同，均匀填充）
+            pad_top = pad_h // 2
+            pad_bottom = pad_h - pad_top
+            pad_left = pad_w // 2
+            pad_right = pad_w - pad_left
+
+            # 对raw和mask进行填充（border_mode=0对应常数填充，默认为0）
+            raw = torch.nn.functional.pad(
+                raw,
+                (0, 0, pad_left, pad_right, pad_top, pad_bottom, 0, 0),  # 注意PyTorch的pad顺序是反向的
+                mode='constant',
+                value=0.0
+            )
+            mask = torch.nn.functional.pad(
+                mask,
+                (0, 0, pad_left, pad_right, pad_top, pad_bottom),
+                mode='constant',
+                value=0
+            )
+
+        # 3. 随机水平翻转（与A.HorizontalFlip一致）
+        if torch.rand(1, device=self.device) < 0.3:
+            raw = torch.flip(raw, dims=[2])  # 水平翻转W维度
+            mask = torch.flip(mask, dims=[2])
+
+        # 4. 随机垂直翻转（与A.VerticalFlip一致）
+        if torch.rand(1, device=self.device) < 0.3:
+            raw = torch.flip(raw, dims=[1])  # 垂直翻转H维度
+            mask = torch.flip(mask, dims=[1])
+
+        # 5. 随机旋转90度（与A.RandomRotate90一致）
+        if torch.rand(1, device=self.device) < 0.3:
+            # 随机选择旋转次数（0-3次，每次90度）
+            k = torch.randint(1, 4, (1,), device=self.device).item()
+            raw = torch.rot90(raw, k=k, dims=[1, 2])  # 在H和W维度旋转
+            mask = torch.rot90(mask, k=k, dims=[0, 1])
+
+        # 6. 随机转置（与A.Transpose一致）
+        if torch.rand(1, device=self.device) < 0.3:
+            raw = torch.transpose(raw, 1, 2)  # 交换H和W维度
+            mask = torch.transpose(mask, 0, 1)
+
+        # 7. 随机亮度对比度调整（与A.RandomBrightnessContrast一致）
+        if torch.rand(1, device=self.device) < 0.3:
+            # 亮度调整范围: [-0.2, 0.2]，对比度调整范围: [-0.2, 0.2]（与albumentations默认一致）
+            brightness_factor = 1.0 + torch.randn(1, device=self.device) * 0.1  # 更集中的分布
+            brightness_factor = torch.clamp(brightness_factor, 0.8, 1.2)
+
+            contrast_factor = 1.0 + torch.randn(1, device=self.device) * 0.1
+            contrast_factor = torch.clamp(contrast_factor, 0.8, 1.2)
+
+            # 先调整亮度
+            raw = raw * brightness_factor
+            # 再调整对比度（使用均值中心化）
+            mean = raw.mean()
+            raw = (raw - mean) * contrast_factor + mean
+            # 确保值仍在[0,1]范围内（归一化后）
+            raw = torch.clamp(raw, 0.0, 1.0)
+
+        return raw, mask
+
+    # 以下是其他辅助方法（保持不变）
+    def erode(self, labels, iterations, border_value):
+        foreground = np.zeros_like(labels, dtype=bool)
+        for label in np.unique(labels):
+            if label == 0:
+                continue
+            label_mask = labels == label
+            eroded_mask = binary_erosion(label_mask, iterations=iterations, border_value=border_value)
+            foreground = np.logical_or(eroded_mask, foreground)
+        background = np.logical_not(foreground)
+        labels[background] = 0
+        return labels
+
+    def get_padding(self, crop_size, padding_size):
+        q = int(crop_size / padding_size)
+        return padding_size * (q + 1) if crop_size % padding_size != 0 else crop_size
+
+    def normalize(self, data):
+        return (data - np.min(data)) / (np.max(data) - np.min(data) + 1e-8).astype(np.float32)
+
+    def get_Mask(self, labels):
+        mask_3D = np.zeros_like(labels, bool)
+        total_unique_labels = np.unique(labels[:, :, 0]).tolist()
+        for label in total_unique_labels:
+            if label == 0:
+                continue
+            mask_label = (labels == label)
+            mask_3D = np.logical_or(mask_3D, mask_label)
+        return mask_3D, None, None
+
+    def generate_gaussian_matrix(self, Points_pos, Points_lab, H, W, theta=10):
+        return np.ones((H, W), dtype=np.float32)
 
 
 class Dataset_3D_semantic_Train(Dataset):
@@ -2068,22 +2452,33 @@ class Dataset_3D_semantic_Train(Dataset):
 
 
 def collate_fn_3D_ninanjie_Train(batch):
-    raw = np.array([item[0] for item in batch]).astype(np.float32)  # 注意normalize了，这里要用float
+    # raw = np.array([item[0] for item in batch]).astype(np.float32)  # 注意normalize了，这里要用float
+    #
+    # labels = np.array([item[1] for item in batch]).astype(np.int32)
+    #
+    # mask_3D = np.array([item[2] for item in batch]).astype(np.uint8)
+    #
+    # affinity = np.array([item[3] for item in batch]).astype(np.float32)
+    #
+    # point_map = np.array([item[4] for item in batch]).astype(np.float32)
+    #
+    # # lsds = np.array([item[5] for item in batch]).astype(np.float32)
+    # if len(batch[0]) == 6:
+    #     lsds = np.array([item[5] for item in batch]).astype(np.float32)
+    #     return raw, labels, mask_3D, affinity, point_map, lsds
+    # else:
+    #     return raw, labels, mask_3D, affinity, point_map
+    """直接在GPU上拼接数据，避免内存传输"""
+    # 从第一个元素获取数据结构
+    num_elements = len(batch[0])
 
-    labels = np.array([item[1] for item in batch]).astype(np.int32)
+    # 拼接每个元素
+    collated = []
+    for i in range(num_elements):
+        # 直接在GPU上拼接张量
+        collated.append(torch.stack([item[i] for item in batch], dim=0))
 
-    mask_3D = np.array([item[2] for item in batch]).astype(np.uint8)
-
-    affinity = np.array([item[3] for item in batch]).astype(np.float32)
-
-    point_map = np.array([item[4] for item in batch]).astype(np.float32)
-
-    # lsds = np.array([item[5] for item in batch]).astype(np.float32)
-    if len(batch[0]) == 6:
-        lsds = np.array([item[5] for item in batch]).astype(np.float32)
-        return raw, labels, mask_3D, affinity, point_map, lsds
-    else:
-        return raw, labels, mask_3D, affinity, point_map
+    return collated
 
     # return raw, labels, mask_3D, affinity, point_map,lsds
 
