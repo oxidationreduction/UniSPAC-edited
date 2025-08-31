@@ -1,3 +1,5 @@
+import gc
+import itertools
 import logging
 import os
 import random
@@ -10,10 +12,12 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 # from torch.utils.tensorboard import SummaryWriter
 from models.unet2d import UNet2d
+from training.utils.aftercare import aftercare
 from training.utils.dataloader_ninanjie import get_acc_prec_recall_f1
 from skimage.metrics import variation_of_information
 from utils.dataloader_ninanjie import Dataset_2D_ninanjie_Train, load_train_dataset, collate_fn_2D_fib25_Train
@@ -93,7 +97,7 @@ class segEM2d(torch.nn.Module):
         self.model_affinity = ACRLSD()
         # model_path = './output/checkpoints/ACRLSD_2D(hemi+fib25+cremi)_Best_in_val.model'
         model_path = ('/home/liuhongyu2024/Documents/UniSPAC-edited/'
-                      'training/output/checkpoints/ACRLSD_2D(ninanjie)_subcell_1_Best_in_val.model')
+                      'training/output/checkpoints/ACRLSD_2D(ninanjie)_half_crop_Best_in_val.model')
         weights = torch.load(model_path, map_location=torch.device('cuda'))
         self.model_affinity.load_state_dict(remove_module(weights))
         for param in self.model_affinity.parameters():
@@ -185,9 +189,9 @@ def model_step(model, optimizer, input_image, input_prompt, gt_binary_mask, gt_a
         loss.backward()
         optimizer.step()
     else:
-        y_mask, gt_binary_mask = y_mask_, gt_binary_mask_
+        y_mask = (y_mask_ > 0.5) + 0.
 
-    return loss, y_mask
+    return (loss, y_mask) if train_step else (loss, y_mask, [loss1, loss2, loss3])
 
 
 def weighted_model_step(model, optimizer, input_image, input_prompt, gt_binary_mask, gt_affinity, activation, train_step=True):
@@ -226,48 +230,183 @@ def weighted_model_step(model, optimizer, input_image, input_prompt, gt_binary_m
     return loss, y_mask
 
 
+def trainer():
+    model = segEM2d().to(device)
+    model = nn.DataParallel(model, device_ids=device_ids, output_device=device)
+
+    ## 创建log日志
+    logger = logging.getLogger()
+    logger.handlers.clear()
+    logger.setLevel(logging.INFO)
+
+    Save_Name = 'w2-{}-w3-{}'.format(WEIGHT_LOSS2, WEIGHT_LOSS3)
+    log_dir = f'./output/log/segEM2d(ninanjie)-prompt/{Save_Name}'
+    if os.path.exists(log_dir):
+        return
+    os.makedirs(log_dir)
+    logfile = os.path.join(log_dir, 'log.txt'.format(Save_Name))
+    csvfile = os.path.join(log_dir, 'log.csv'.format(Save_Name))
+    fh = logging.FileHandler(logfile, mode='a', delay=False)
+    fh.setLevel(logging.DEBUG)
+    formatter = logging.Formatter("%(asctime)s - %(filename)s[line:%(lineno)d] - %(levelname)s: %(message)s")
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    logging.info(f'''Starting training:
+        training_epochs:  {training_epochs}
+        Num_slices_train: {len(train_dataset)}
+        Num_slices_val:   {len(val_dataset)}
+        Batch size:       {batch_size}
+        Learning rate:    {learning_rate}
+        Device:           {device.type}
+        ''')
+
+    writer = SummaryWriter(log_dir=log_dir)
+
+    ##开始训练
+    # set optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    # set activation
+    activation = torch.nn.Sigmoid()
+
+    # training loop
+    model.train()
+    epoch = 0
+    Best_val_loss = 10000
+    Best_epoch = 0
+    early_stop_count = 64
+    no_improve_count = 0
+    with (tqdm(total=training_epochs) as pbar):
+        analysis = pd.DataFrame(columns=['accuracy', 'precision', 'recall', 'f1', 'voi'])
+        progress_desc, train_desc, val_desc = '', '', ''
+        while epoch < training_epochs:
+            ###################Train###################
+            model.train()
+            # reset data loader to get random augmentations
+            np.random.seed()
+            random.seed()
+            count, total = 0, len(train_loader)
+            # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_loader:
+            train_desc = f"Best: {Best_epoch}, loss: {Best_val_loss:.2f}, "
+            for raw, labels, point_map, mask, gt_affinity in train_loader:
+                model_step(model, optimizer, raw, point_map, mask, gt_affinity, activation,
+                                                       train_step=True)
+                count += 1
+                progress_desc = f'Train: {count}/{total}, '
+                pbar.set_description(progress_desc + train_desc + val_desc)
+            ###################Validate###################
+            model.eval()
+            ##Fix validation set
+            seed = 98
+            np.random.seed(seed)
+            random.seed(seed)
+            acc_loss = []
+            detailed_losses = np.array([0.] * 3)
+            count, total = 0, len(val_loader)
+            # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_val_loader:
+            metrics = np.asarray((0, 0, 0, 0), dtype=np.float64)
+            voi_val = 0
+            for raw, labels, point_map, mask, gt_affinity in val_loader:
+                with torch.no_grad():
+                    loss_value, y_mask, losses = model_step(model, optimizer, raw, point_map, mask, gt_affinity,
+                                                             activation,
+                                                             train_step=False)
+                    acc_loss.append(loss_value)
+                    binary_y_mask = np.asarray(aftercare(y_mask.detach().cpu())).flatten()
+                    binary_gt_seg = ((np.asarray(labels) > 0.0) + 0).flatten()
+
+                    metrics += np.asarray(get_acc_prec_recall_f1(binary_y_mask, binary_gt_seg))
+                    voi_val += np.sum(variation_of_information(binary_y_mask, binary_gt_seg))
+                    detailed_losses += np.asarray([loss_.cpu().detach().numpy() for loss_ in losses])
+
+                count += 1
+                progress_desc = f'Val: {count}/{total}, '
+                pbar.set_description(progress_desc + train_desc + val_desc)
+
+            metrics /= (total + 0.0)
+            voi_val /= (total + 0.0)
+            detailed_losses /= (total + 0.)
+            bce_, dice_, affinity_ = detailed_losses[:]
+            acc, prec, recall, f1 = metrics[:]
+            val_desc = f'acc: {acc:.3f}, prec: {prec:.3f}, recall: {recall:.3f}, f1: {f1:.3f}, VOI: {voi_val:.5f}'
+            analysis.loc[len(analysis)] = [acc, prec, recall, f1, voi_val]
+            # val_loss = np.mean(np.array([loss_value.cpu().numpy() for loss_value in acc_loss]))
+            val_loss = torch.stack([loss_value.cpu() for loss_value in acc_loss]).mean().item()
+
+            epoch += 1
+            pbar.update(1)
+
+            writer.add_scalar('loss/val', val_loss, epoch)
+            writer.add_scalar('loss/bce', bce_, epoch)
+            writer.add_scalar('loss/dice', dice_, epoch)
+            writer.add_scalar('loss/affinity', affinity_, epoch)
+            writer.add_scalar('VOI', voi_val, epoch)
+            writer.add_scalar('metrics/acc', acc, epoch)
+            writer.add_scalar('metrics/prec', prec, epoch)
+            writer.add_scalar('metrics/recall', recall, epoch)
+            writer.add_scalar('metrics/f1', f1, epoch)
+
+            ###################Compare###################
+            if Best_val_loss > val_loss:
+                Best_val_loss = val_loss
+                Best_epoch = epoch
+                torch.save(model.module.state_dict(), os.path.join(log_dir, '{}_Best_in_val.model'.format(Save_Name)))
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+
+            ##Record
+            logging.info("Epoch {}: val_loss = {:.6f},with best val_loss = {:.6f} in epoch {}".format(
+                epoch, val_loss, Best_val_loss, Best_epoch))
+            fh.flush()
+            # writer.add_scalar('val_loss', val_loss, epoch)
+            analysis.to_csv(csvfile)
+
+            ##Early stop
+            if no_improve_count == early_stop_count:
+                logging.info("Early stop!")
+                break
+
+    del model, optimizer, activation
+    gc.collect()
+
+
 if __name__ == '__main__':
     ##设置超参数
     training_epochs = 10000
     learning_rate = 1e-4
-    batch_size = 64
+    batch_size = 80
 
     set_seed()
-    os.environ['CUDA_VISIBLE_DEVICES'] = '2,3,4,5'  # 设置所有可以使用的显卡，共计四块,
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,4,1'  # 设置所有可以使用的显卡，共计四块,
     device_ids = [i for i in range(len(os.environ['CUDA_VISIBLE_DEVICES'].split(',')))]   # 选中显卡
-    device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
 
-    model = segEM2d().to(device)
-    # set device
-    model = nn.DataParallel(model, device_ids=device_ids, output_device=device)#并行使用两块
-    # model = torch.nn.DataParallel(model)  # 默认使用所有的 device_ids
-    # model = model.to(device)
-
     ##装载数据
-    class_num = 1
-    dataset_names = ['second_6']
-    Save_Name = 'segEM2d(ninanjie)_subcell_{}-w2-{}-w3-{}_512'.format(class_num, WEIGHT_LOSS2, WEIGHT_LOSS3)
+    dataset_names = ['best_truth']
 
     ##装载数据
     crop_xyz = [4, 4, 1]
     train_dataset, val_dataset = [], []
     for dataset_name in dataset_names:
-        for i in range(crop_xyz[0] - 1):
-            for j in range(crop_xyz[1]):
-                for k in range(crop_xyz[2]):
-                    train_tmp, val_tmp = load_train_dataset(dataset_name, raw_dir='raw_2', label_dir='label_2',
-                                                            from_temp=True, require_xz_yz=False, crop_size=512,
-                                                            crop_xyz=crop_xyz, chunk_position=[i, j, k])
-                    train_dataset.append(train_tmp)
-                    val_dataset.append(val_tmp)
+        for i, j, k in itertools.product(
+                range(crop_xyz[0] - 1),
+                range(crop_xyz[1]),
+                range(crop_xyz[2])
+        ):
+            train_tmp, val_tmp = load_train_dataset(dataset_name, raw_dir='raw_2', label_dir='label_2',
+                                                    from_temp=True, require_xz_yz=False, crop_size=512,
+                                                    require_lsd=False,
+                                                    crop_xyz=crop_xyz, chunk_position=[i, j, k])
+            train_dataset.append(train_tmp)
+            val_dataset.append(val_tmp)
 
     train_dataset = ConcatDataset(train_dataset)
     val_dataset = ConcatDataset(val_dataset)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=48, pin_memory=True,
                               drop_last=False, collate_fn=collate_fn_2D_fib25_Train)
-    val_loader = DataLoader(val_dataset, batch_size=(batch_size // 2) + 1, shuffle=True, num_workers=48, pin_memory=True,
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=48, pin_memory=True,
                             collate_fn=collate_fn_2D_fib25_Train)
 
     def load_data_to_device(loader):
@@ -286,113 +425,7 @@ if __name__ == '__main__':
 
     train_loader, val_loader = load_data_to_device(train_loader), load_data_to_device(val_loader)
 
-    ## 创建log日志
-    logger = logging.getLogger()
-    logger.handlers.clear()
-    logger.setLevel(logging.INFO)
-    logfile = './output/log/log_{}.txt'.format(Save_Name)
-    csvfile = './output/log/log_{}.csv'.format(Save_Name)
-    fh = logging.FileHandler(logfile, mode='a', delay=False)
-    fh.setLevel(logging.DEBUG)
-    formatter = logging.Formatter("%(asctime)s - %(filename)s[line:%(lineno)d] - %(levelname)s: %(message)s")
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-
-    logging.info(f'''Starting training:
-    training_epochs:  {training_epochs}
-    Num_slices_train: {len(train_dataset)}
-    Num_slices_val:   {len(val_dataset)}
-    Batch size:       {batch_size}
-    Learning rate:    {learning_rate}
-    Device:           {device.type}
-    ''')
-
-    ##开始训练
-    # set optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    # set activation
-    activation = torch.nn.Sigmoid()
-
-    # training loop
-    model.train()
-    epoch = 0
-    Best_val_loss = 10000
-    Best_epoch = 0
-    early_stop_count = 100
-    no_improve_count = 0
-    with (tqdm(total=training_epochs) as pbar):
-        analysis = pd.DataFrame(columns=['accuracy', 'precision', 'recall', 'f1', 'voi'])
-        progress_desc, train_desc, val_desc = '', '', ''
-        while epoch < training_epochs:
-            ###################Train###################
-            model.train()
-            # reset data loader to get random augmentations
-            np.random.seed()
-            random.seed()
-            count, total = 0, len(train_loader)
-            # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_loader:
-            for raw, labels, point_map, mask, gt_affinity in train_loader:
-                loss_value, pred = weighted_model_step(model, optimizer, raw, point_map, mask, gt_affinity, activation,
-                                              train_step=True)
-                count += 1
-                progress_desc = f'Train: {count}/{total}, '
-                train_desc = f"Best: {Best_epoch}, loss: {Best_val_loss:.2f}, "
-                pbar.set_description(progress_desc + train_desc + val_desc)
-
-            ###################Validate###################
-            model.eval()
-            ##Fix validation set
-            seed = 98
-            np.random.seed(seed)
-            random.seed(seed)
-            acc_loss = []
-            count, total = 0, len(val_loader)
-            # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_val_loader:
-            metrics = np.asarray((0, 0, 0, 0), dtype=np.float64)
-            voi_val = 0
-            for raw, labels, point_map, mask, gt_affinity in val_loader:
-                with torch.no_grad():
-                    loss_value, y_mask = weighted_model_step(model, optimizer, raw, point_map, mask, gt_affinity, activation,
-                                               train_step=False)
-                    acc_loss.append(loss_value)
-                    binary_y_mask = ((np.asarray(y_mask.detach().cpu()) > 0.5) + 0).flatten()
-                    binary_gt_seg = ((np.asarray(labels) > 0.0) + 0).flatten()
-
-                    metrics += np.asarray(get_acc_prec_recall_f1(binary_y_mask, binary_gt_seg))
-                    voi_val += np.sum(variation_of_information(binary_y_mask, binary_gt_seg))
-
-                count += 1
-                progress_desc = f'Val: {count}/{total}, '
-                pbar.set_description(progress_desc + train_desc + val_desc)
-
-            metrics /= (total + 0.0)
-            voi_val /= (total + 0.0)
-            acc, prec, recall, f1 = metrics[:]
-            val_desc = f'acc: {acc:.3f}, prec: {prec:.3f}, recall: {recall:.3f}, f1: {f1:.3f}, VOI: {voi_val:.5f}'
-            analysis.loc[len(analysis)] = [acc, prec, recall, f1, voi_val]
-            # val_loss = np.mean(np.array([loss_value.cpu().numpy() for loss_value in acc_loss]))
-            val_loss = torch.stack([loss_value.cpu() for loss_value in acc_loss]).mean().item()
-
-            epoch += 1
-            pbar.update(1)
-
-            ###################Compare###################
-            if Best_val_loss > val_loss:
-                Best_val_loss = val_loss
-                Best_epoch = epoch
-                torch.save(model.module.state_dict(), './output/checkpoints/{}_Best_in_val.model'.format(Save_Name))
-                no_improve_count = 0
-            else:
-                no_improve_count += 1
-
-            ##Record
-            logging.info("Epoch {}: val_loss = {:.6f},with best val_loss = {:.6f} in epoch {}".format(
-                epoch, val_loss, Best_val_loss, Best_epoch))
-            fh.flush()
-            # writer.add_scalar('val_loss', val_loss, epoch)
-            analysis.to_csv(csvfile)
-
-            ##Early stop
-            if no_improve_count == early_stop_count:
-                logging.info("Early stop!")
-                break
+    for WEIGHT_LOSS2, WEIGHT_LOSS3 in itertools.product(
+        [1, 5], [1, 5]
+    ):
+        trainer()

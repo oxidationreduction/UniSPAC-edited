@@ -16,6 +16,7 @@ from tqdm.auto import tqdm
 
 # from torch.utils.tensorboard import SummaryWriter
 from models.unet3d import UNet3d
+from training.utils.dataloader_ninanjie import load_semantic_dataset, load_3d_semantic_dataset
 from utils.dataloader_ninanjie import load_train_dataset, collate_fn_3D_ninanjie_Train
 
 
@@ -136,32 +137,33 @@ def weighted_model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, ac
 
 
 def _load_datasets(dataset_name_, crop_size_, crop_xyz_, a, b, c):
-    return load_train_dataset(dataset_name_, raw_dir='raw_2', label_dir='truth_label_2', from_temp=True,
-                              crop_size=crop_size_, crop_xyz=crop_xyz_, chunk_position=[a, b, c])
+    return load_3d_semantic_dataset(dataset_name_, raw_dir='raw', label_dir='export', from_temp=True,
+                                 crop_size=crop_size_, crop_xyz=crop_xyz_, chunk_position=[a, b, c])
 
 
 if __name__ == '__main__':
     ##设置超参数
     training_epochs = 10000
     learning_rate = 1e-4
-    batch_size = 15
+    batch_size = 24
     # Save_Name = 'ACRLSD_3D(hemi+fib25+cremi)'
     # Save_Name = 'ACRLSD_3D(ninanjie)'
 
     set_seed()
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = '4,5,3'
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    dataset_names = ['fourth_1_3d', 'second_6_3d']
+    crop_size = 384
+    crop_xyz = [4, 3, 1]
+    train_dataset, val_dataset = [], []
+
+    os.environ['CUDA_VISIBLE_DEVICES'] = '4,5,1,3,0'
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
     gpus = [i for i in range(len(os.environ['CUDA_VISIBLE_DEVICES'].split(',')))]
 
     model = ACRLSD_3d().to(device)
     model = nn.DataParallel(model.cuda(), device_ids=gpus, output_device=gpus[0])
-
-    dataset_names = ['second_6_3d', 'fourth_1_3d']
-    crop_size = 384
-    crop_xyz = [4, 3, 1]
-    train_dataset, val_dataset = [], []
+    Save_Name = f'ACRLSD_3D(semantic)_{crop_size}'
 
     multiprocessing.set_start_method('spawn', force=True)
     with multiprocessing.Pool(14) as pool:
@@ -174,10 +176,12 @@ if __name__ == '__main__':
             ):
                 results.append(pool.apply_async(_load_datasets, args=(dataset_name, crop_size, crop_xyz, i, j, k)))
         for result_ in results:
-            train_, val_ = result_.get()
-            train_dataset.append(train_)
-            val_dataset.append(val_)
+            train_dataset.append(result_.get())
 
+    random.shuffle(train_dataset)
+    val_size = len(train_dataset) // 6
+    val_dataset = train_dataset[:val_size]
+    train_dataset = train_dataset[val_size:]
     # for dataset_name, i, j, k in itertools.product(
     #         dataset_names,
     #         range(crop_xyz[0] - 1),
@@ -187,32 +191,11 @@ if __name__ == '__main__':
     #     train_, val_ = _load_datasets(dataset_name, crop_size, crop_xyz, i, j, k)
     #     train_dataset.append(train_)
     #     val_dataset.append(val_)
-
     train_dataset, val_dataset = ConcatDataset(train_dataset), ConcatDataset(val_dataset)
-
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False,
                               drop_last=True, collate_fn=collate_fn_3D_ninanjie_Train)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False,
                             collate_fn=collate_fn_3D_ninanjie_Train)
-
-    Save_Name = f'ACRLSD_3D(ninanjie)_{crop_size}'
-
-
-    def load_data_to_device(loader):
-        res = []
-        for raw, labels, mask_3D, gt_affinity, point_map, gt_lsds in loader:
-            raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
-            # labels = torch.as_tensor(labels, dtype=torch.int32, device=device)
-            # mask_3D = torch.as_tensor(mask_3D, dtype=torch.uint8, device=device)
-            # point_map = torch.as_tensor(point_map, dtype=torch.float, device=device)
-            gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
-            gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
-                                          device=device)  # (batch, 2, height, width)
-            res.append((raw, labels, mask_3D, gt_affinity, point_map, gt_lsds))
-        return res
-
-
-    # train_loader, val_loader = load_data_to_device(train_loader), load_data_to_device(val_loader)
 
     ##创建log日志
     logger = logging.getLogger()
@@ -252,7 +235,7 @@ if __name__ == '__main__':
     epoch = 0
     Best_val_loss = 100000
     Best_epoch = 0
-    early_stop_count = 100
+    early_stop_count = 50
     no_improve_count = 0
     with tqdm(total=training_epochs) as pbar:
         analysis = pd.DataFrame(columns=['loss', 'voi'])
@@ -266,13 +249,6 @@ if __name__ == '__main__':
             tmp_loader = iter(train_loader)
             count, total = 0, len(tmp_loader)
             for raw, labels, mask_3D, gt_affinity, point_map, gt_lsds in tmp_loader:
-                # _raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
-                # # labels = torch.as_tensor(labels, dtype=torch.int32, device=device)
-                # # mask_3D = torch.as_tensor(mask_3D, dtype=torch.uint8, device=device)
-                # # point_map = torch.as_tensor(point_map, dtype=torch.float, device=device)
-                # _gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
-                # _gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float, device=device)
-                # model_step(model, loss_fn, optimizer, _raw, _gt_lsds, _gt_affinity, activation)
                 model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation)
 
                 count += 1
@@ -291,13 +267,6 @@ if __name__ == '__main__':
             voi_val = 0
             count, total = 0, len(tmp_val_loader)
             for raw, labels, mask_3D, gt_affinity, point_map, gt_lsds in tmp_val_loader:
-                # _raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
-                # # labels = torch.as_tensor(labels, dtype=torch.int32, device=device)
-                # # mask_3D = torch.as_tensor(mask_3D, dtype=torch.uint8, device=device)
-                # # point_map = torch.as_tensor(point_map, dtype=torch.float, device=device)
-                # _gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
-                # _gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float, device=device)
-
                 with torch.no_grad():
                     # loss_value, outputs = model_step(model, loss_fn, optimizer, _raw, _gt_lsds, _gt_affinity,
                     #                                  activation, train_step=False)

@@ -418,7 +418,3 @@ if __name__ == '__main__':
             if no_improve_count==early_stop_count:
                 logging.info("Early stop!")
                 break
-            
-       
-
-

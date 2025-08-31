@@ -12,7 +12,6 @@ import logging
 import zarr
 
 import matplotlib.pyplot as plt
-import pyvoi
 
 
 import numpy as np

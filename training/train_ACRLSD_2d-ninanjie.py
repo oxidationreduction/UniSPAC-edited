@@ -21,7 +21,7 @@ from utils.dataloader_hemi_better import Dataset_2D_hemi_Train, collate_fn_2D_he
 
 ## CUDA_VISIBLE_DEVICES=1 python train_ACRLSD_2d.py &
 
-def set_seed(seed=1998):
+def set_seed(seed=19260817):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)

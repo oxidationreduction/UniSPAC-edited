@@ -1,4 +1,5 @@
 import gc
+import itertools
 import logging
 import os
 import random
@@ -10,11 +11,13 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 # from torch.utils.tensorboard import SummaryWriter
 from models.unet2d import UNet2d
-from training.utils.dataloader_ninanjie import load_semantic_dataset
+from training.utils.aftercare import calculate_multi_class_voi, visualize_and_save_mask, aftercare
+from training.utils.dataloader_ninanjie import load_semantic_dataset, collate_fn_2D_cellmask_Train
 from utils.dataloader_ninanjie import collate_fn_2D_fib25_Train
 
 
@@ -142,6 +145,7 @@ class DiceLoss(torch.nn.Module):
             dice = (2. * intersection + self.smooth) / (union + self.smooth)
             total_dice += dice
         return 1 - (total_dice / num_classes)
+    
 class WeightedDiceLoss(torch.nn.Module):
     def __init__(self, weights, smooth=1e-5):
         super().__init__()
@@ -243,102 +247,30 @@ def weighted_model_step(model, optimizer, input_image, input_prompt, gt_semantic
         loss.backward()
         optimizer.step()
     else:
-        y_probs = torch.argmax(y_probs, dim=1)
+        y_probs = aftercare(torch.argmax(y_probs, dim=1).cpu())
 
     return loss, y_probs, losses
 
 
-def calculate_multi_class_voi(pred, gt):
-    """
-    多类别VOI计算（GPU加速版）
-    参数:
-        pred: 预测标签张量，形状[H, W]，值为0-3（可在CPU/GPU，函数内部自动转移到GPU）
-        gt: 真实标签张量，形状[H, W]，值为0-3（同上）
-    返回:
-        voi: 计算得到的VOI值（标量）
-    """
-    # 转换为GPU张量并展平（若已在GPU则不重复转移）
-    pred = torch.as_tensor(pred, dtype=torch.long).flatten()
-    gt = torch.as_tensor(gt, dtype=torch.long).flatten()
-    total = pred.numel()  # 总像素数
-    if total == 0:
-        return 0.0
-
-    # ----------------------
-    # 1. 计算边缘概率分布 P(pred) 和 P(gt)
-    # ----------------------
-    def get_prob(tensor):
-        # 计算唯一值及对应计数（GPU上执行）
-        unique, counts = torch.unique(tensor, return_counts=True)
-        prob = counts.float() / total
-        return unique, prob
-
-    # 预测标签的概率分布
-    pred_unique, prob_pred = get_prob(pred)
-    # 真实标签的概率分布
-    gt_unique, prob_gt = get_prob(gt)
-
-    # ----------------------
-    # 2. 计算联合概率分布 P(pred, gt)
-    # ----------------------
-    # 拼接预测和真实标签为二维张量（形状[N, 2]），用于计算联合唯一值
-    joint = torch.stack([pred, gt], dim=1)  # [N, 2]
-    # 计算联合唯一值及计数（关键优化：替代循环构建字典）
-    joint_unique, joint_counts = torch.unique(joint, dim=0, return_counts=True)
-    joint_prob = joint_counts.float() / total  # 联合概率
-
-    # ----------------------
-    # 3. 计算熵 H(pred) 和 H(gt)
-    # ----------------------
-    eps = 1e-10  # 避免log2(0)
-    h_pred = -torch.sum(prob_pred * torch.log2(prob_pred + eps))  # 向量化计算
-    h_gt = -torch.sum(prob_gt * torch.log2(prob_gt + eps))
-
-    # ----------------------
-    # 4. 计算互信息 I(pred, gt)
-    # ----------------------
-    mi = 0.0
-    # 遍历所有联合唯一值（数量远少于总像素，高效）
-    for idx in range(joint_unique.shape[0]):
-        p_val = joint_unique[idx, 0]  # 预测值
-        g_val = joint_unique[idx, 1]  # 真实值
-        p_joint = joint_prob[idx]      # 联合概率
-
-        # 找到对应边缘概率（利用张量索引加速）
-        p_p = prob_pred[pred_unique == p_val].item()
-        p_g = prob_gt[gt_unique == g_val].item()
-
-        if p_p > eps and p_g > eps and p_joint > eps:
-            mi += p_joint * torch.log2(p_joint / (p_p * p_g) + eps).item()
-
-    # 计算VOI
-    voi = (h_pred + h_gt - 2 * mi).item()
-    return voi
-
-def trainer():
+def trainer(save_dir):
     model = segEM2d().to(device)
     # set device
     model = nn.DataParallel(model, device_ids=device_ids, output_device=device)  # 并行使用两块
     # model = torch.nn.DataParallel(model)  # 默认使用所有的 device_ids
     # model = model.to(device)
 
-    save_dir = os.path.join('./output/segEM2d(ninanjie)_semantic',
-                            f'{"-".join([str(_) for _ in WEIGHT_LOSSES])}',
-                            f'{"-".join([str(_) for _ in label_weights])}')
-    os.makedirs(save_dir, exist_ok=True)
-    Save_Name = f'segEM2d(ninanjie)_semantic-{crop_size}'
-
     ## 创建log日志
     logger = logging.getLogger()
     logger.handlers.clear()
     logger.setLevel(logging.INFO)
-    logfile = f'{save_dir}/log_{Save_Name}.txt'
-    csvfile = f'{save_dir}/log_{Save_Name}.csv'
+    logfile = f'{save_dir}/log.txt'
+    csvfile = f'{save_dir}/log.csv'
     fh = logging.FileHandler(logfile, mode='a', delay=False)
     fh.setLevel(logging.DEBUG)
     formatter = logging.Formatter("%(asctime)s - %(filename)s[line:%(lineno)d] - %(levelname)s: %(message)s")
     fh.setFormatter(formatter)
     logger.addHandler(fh)
+    writer = SummaryWriter(log_dir=save_dir)
 
     logging.info(f'''Starting training:
         training_epochs:  {training_epochs}
@@ -362,7 +294,7 @@ def trainer():
     Best_val_loss = 10000
     Best_voi = 10000
     Best_epoch = 0
-    early_stop_count = 64
+    early_stop_count = 50
     no_improve_count = 0
     with (tqdm(total=training_epochs) as pbar):
         analysis = pd.DataFrame(columns=['loss', 'voi', 'bce', 'dice', 'affinity'])
@@ -375,8 +307,8 @@ def trainer():
             random.seed()
             count, total = 0, len(train_loader)
             # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_loader:
-            for raw, labels, point_map, mask, gt_affinity in train_loader:
-                weighted_model_step(model, optimizer, raw, point_map, labels, gt_affinity, activation,
+            for raw, cellmasked_raw, labels, point_map, mask, gt_affinity in train_loader:
+                weighted_model_step(model, optimizer, cellmasked_raw, point_map, labels, gt_affinity, activation,
                                     pos_weight=pos_weight, train_step=True)
                 count += 1
                 progress_desc = f'Train: {count}/{total}, '
@@ -394,26 +326,36 @@ def trainer():
             # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_val_loader:
             judgment_rates = 0.0
             # metrics = np.asarray((0, 0, 0, 0), dtype=np.float64)
-            for raw, labels, point_map, mask, gt_affinity in val_loader:
+            for raw, cellmasked_raw, labels, point_map, mask, gt_affinity in val_loader:
                 with torch.no_grad():
-                    loss_value, y_pred, losses = weighted_model_step(model, optimizer, raw, point_map, labels,
+                    loss_value, y_pred, losses = weighted_model_step(model, optimizer, cellmasked_raw, point_map, labels,
                                                                      gt_affinity, activation,
                                                                      pos_weight=pos_weight, train_step=False)
-                    labels = torch.argmax(labels, dim=1)
+                    labels = torch.argmax(labels, dim=1).cpu()
                     judgment_rates += calculate_multi_class_voi(y_pred, labels)
                 count += 1
                 progress_desc = f'Val: {count}/{total}, '
                 pbar.set_description(progress_desc + train_desc + val_desc)
                 acc_loss.append(loss_value)
-            # val_loss = np.mean(np.array([loss_value.cpu().numpy() for loss_value in acc_loss]))
+
             judgment_rates /= (total + 0.)
-            if epoch > 32 and judgment_rates < Best_voi:
-                Best_voi = judgment_rates
-                torch.save(model.module.state_dict(), f'{save_dir}/{Save_Name}_voi.model')
 
             val_loss = torch.stack([loss_value.cpu() for loss_value in acc_loss]).mean().item()
             analysis.loc[len(analysis)] = [val_loss, judgment_rates].extend(losses)
-            val_desc = f'Best VOI: {Best_voi:.4f}, VOI: {judgment_rates:.4f}' if epoch > 32 else 'Updating VOI'
+            val_desc = f'Best VOI: {Best_voi:.4f}, VOI: {judgment_rates:.4f}' if epoch > 20 else 'Updating VOI'
+
+            raw = torch.as_tensor(raw)
+            cellmasked_raw = torch.as_tensor(cellmasked_raw.cpu())
+            y_pred = torch.as_tensor(y_pred)
+
+            visualize_and_save_mask(raw, y_pred, mode='visual/seg_only', idx=epoch, writer=writer)
+            visualize_and_save_mask(raw, y_pred, mode='visual/normal', idx=epoch, writer=writer)
+            visualize_and_save_mask(cellmasked_raw, y_pred, mode='visual/cellmask', idx=epoch, writer=writer)
+            writer.add_scalar('loss/val', val_loss, epoch)
+            writer.add_scalar('loss/bce', losses[0], epoch)
+            writer.add_scalar('loss/dice', losses[1], epoch)
+            writer.add_scalar('loss/affinity', losses[2], epoch)
+            writer.add_scalar('VOI', judgment_rates, epoch)
 
             epoch += 1
             pbar.update(1)
@@ -422,10 +364,14 @@ def trainer():
             if Best_val_loss > val_loss:
                 Best_val_loss = val_loss
                 Best_epoch = epoch
-                torch.save(model.module.state_dict(), f'{save_dir}/{Save_Name}.model')
+                torch.save(model.module.state_dict(), f'{save_dir}/Best_in_val.model')
                 no_improve_count = 0
             else:
                 no_improve_count += 1
+
+            if epoch > 20 and judgment_rates < Best_voi:
+                Best_voi = judgment_rates
+                torch.save(model.module.state_dict(), f'{save_dir}/Best_voi.model')
 
             ##Record
             logging.info("Epoch {}: val_loss = {:.6f}, voi = {:.6f} with best val_loss = {:.6f} in epoch {}".format(
@@ -439,7 +385,7 @@ def trainer():
                 logging.info("Early stop!")
                 break
 
-    torch.save(model.module.state_dict(), f'{save_dir}/{Save_Name}_final.model')
+    torch.save(model.module.state_dict(), f'{save_dir}/final.model')
     del model, optimizer, activation
     torch.cuda.empty_cache()
     gc.collect()
@@ -449,68 +395,71 @@ if __name__ == '__main__':
     ##设置超参数
     training_epochs = 10000
     learning_rate = 2e-4
-    batch_size = 48
+    batch_size = 72
 
     set_seed()
-    os.environ['CUDA_VISIBLE_DEVICES'] = '2,4,5'  # 设置所有可以使用的显卡，共计四块,
+    os.environ['CUDA_VISIBLE_DEVICES'] = '4,1,0,5'  # 设置所有可以使用的显卡，共计四块,
     device_ids = [i for i in range(len(os.environ['CUDA_VISIBLE_DEVICES'].split(',')))]   # 选中显卡
-    device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
 
     ##装载数据
-    dataset_names = ['second_6', 'fourth_1']
+    dataset_names = ['second_6_cellmask', 'fourth_1_cellmask']
 
     ##装载数据
     # WEIGHT_LOSSES = [1., 2., 1.]
     # label_weights = [1, 16, 10, 50]
-    crop_size = 576
+    crop_size = 512
     crop_xyz = [4, 4, 1]
     train_dataset, val_dataset = [], []
-    for dataset_name in dataset_names:
-        for i in range(crop_xyz[0] - 1):
-            for j in range(crop_xyz[1]):
-                for k in range(crop_xyz[2]):
-                    train_tmp, val_tmp = load_semantic_dataset(dataset_name, raw_dir='raw', label_dir='export',
-                                                               require_xz_yz=False, from_temp=True,
-                                                               crop_xyz=crop_xyz, chunk_position=[i, j, k],
-                                                               crop_size=crop_size)
-                    train_dataset.append(train_tmp)
-                    val_dataset.append(val_tmp)
+    for dataset_name, i, j, k in itertools.product(
+            dataset_names,
+            range(crop_xyz[0] - 1),
+            range(crop_xyz[1]),
+            range(crop_xyz[2])
+    ):
+        train_tmp, val_tmp = load_semantic_dataset(dataset_name, raw_dir='raw', label_dir='export',
+                                                   require_xz_yz=False, from_temp=True,
+                                                   require_lsd=False,
+                                                   crop_xyz=crop_xyz, chunk_position=[i, j, k],
+                                                   crop_size=crop_size)
+        train_dataset.append(train_tmp)
+        val_dataset.append(val_tmp)
 
     train_dataset = ConcatDataset(train_dataset)
     val_dataset = ConcatDataset(val_dataset)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=48, pin_memory=True,
-                              drop_last=False, collate_fn=collate_fn_2D_fib25_Train)
+                              drop_last=False, collate_fn=collate_fn_2D_cellmask_Train)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=48, pin_memory=True,
-                            drop_last=False, collate_fn=collate_fn_2D_fib25_Train)
+                            drop_last=False, collate_fn=collate_fn_2D_cellmask_Train)
 
 
     def load_data_to_device(loader):
         tmp_loader = iter(loader)
         res = []
         # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_loader:
-        for raw, labels, point_map, mask, gt_affinity, _ in tqdm(tmp_loader, leave=False, desc='load to cuda'):
+        for raw, cellmasked_raw, labels, point_map, mask, gt_affinity, _ in tqdm(tmp_loader, leave=False, desc='load to cuda'):
             ##Get Tensor
-            raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
+            cellmasked_raw = torch.as_tensor(cellmasked_raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
             labels = torch.as_tensor(labels, dtype=torch.float, device=device)  # (batch, 1, height, width)
             point_map = torch.as_tensor(point_map, dtype=torch.float, device=device)  # (batch, height, width)
             mask = torch.as_tensor(mask, dtype=torch.float, device=device)  # (batch, 1, height, width)
             gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
                                           device=device)  # (batch, 2, height, width)
-            res.append([raw, labels, point_map, mask, gt_affinity])
+            res.append([raw, cellmasked_raw, labels, point_map, mask, gt_affinity])
         return res
 
 
     train_loader, val_loader = load_data_to_device(train_loader), load_data_to_device(val_loader)
 
-    for WEIGHT_LOSSES in [[1., 2., 1.], [1., 1., 2.], [2., 1., 1.], [1., 1., 1.]]:
-        for label_weights in [[1, 16, 10, 50], [1, 8, 5, 25], [1, 4, 3, 7]]:
-            save_dir = os.path.join('./output/segEM2d(ninanjie)_semantic',
+    for WEIGHT_LOSSES in [[1., 5., 1.], [1., 5., 5.], [5., 1., 1.]]:
+        for label_weights in [[1, 4, 3, 7], [1, 1, 1, 1]]:
+            save_dir = os.path.join('./output/log/segEM2d(ninanjie)_semantic-prompt',
                                     f'{"-".join([str(_) for _ in WEIGHT_LOSSES])}',
                                     f'{"-".join([str(_) for _ in label_weights])}')
             if os.path.exists(save_dir):
                 continue
             os.makedirs(save_dir)
-            trainer()
+            trainer(save_dir)
 
