@@ -429,7 +429,7 @@ def visualize_and_save_mask(raw: torch.Tensor, segmentation: torch.Tensor, idx=0
     segmentation = measure.label(segmentation)
 
     # 处理模式为'seg_only'的情况
-    if mode == 'seg_only':
+    if 'seg_only' in mode:
         mask = segmentation > 0
         raw = raw * mask
 
@@ -492,7 +492,7 @@ def visualize_and_save_mask(raw: torch.Tensor, segmentation: torch.Tensor, idx=0
     plt.close()
 
 
-def trainer(log_dir):
+def trainer(log_dir_):
     model = segEM_3d()
     model = model.to(device)
 
@@ -506,11 +506,12 @@ def trainer(log_dir):
     logger = logging.getLogger()
     logger.handlers.clear()
     logger.setLevel(logging.INFO)
-    log_dir = f'{log_dir}/{Save_Name}'
+    log_dir_ = f'{log_dir_}/{Save_Name}'
+    os.makedirs(log_dir_)
 
-    logfile = '{}/log.txt'.format(log_dir)
-    csvfile = '{}/log.csv'.format(log_dir)
-    writer = SummaryWriter(log_dir=log_dir)
+    logfile = '{}/log.txt'.format(log_dir_)
+    csvfile = '{}/log.csv'.format(log_dir_)
+    writer = SummaryWriter(log_dir=log_dir_)
     fh = logging.FileHandler(logfile, mode='a')
     fh.setLevel(logging.DEBUG)
     formatter = logging.Formatter("%(asctime)s - %(filename)s[line:%(lineno)d] - %(levelname)s: %(message)s")
@@ -538,7 +539,7 @@ def trainer(log_dir):
     epoch = 0
     Best_val_loss = 100000
     Best_epoch = 0
-    early_stop_count = 64
+    early_stop_count = 50
     no_improve_count = 0
     with tqdm(total=training_epochs) as pbar:
         analysis = pd.DataFrame(columns=['bce', 'dice', 'affinity', 'acc', 'prec', 'recall', 'f1', 'voi'])
@@ -553,7 +554,7 @@ def trainer(log_dir):
             tmp_loader = iter(train_loader)
             count, total = 0, len(tmp_loader)
             # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_loader:
-            for raw, labels, mask, affinity, point_map, gt_lsd in tmp_loader:
+            for raw, labels, mask, affinity, point_map in tmp_loader:
                 ##Get Tensor
                 # raw = torch.as_tensor(raw,dtype=torch.float, device= device)
                 # point_map = torch.as_tensor(point_map, dtype=torch.float, device=device)
@@ -578,7 +579,7 @@ def trainer(log_dir):
             judgement_rates = np.array([0.] * 4)
             count, total = 0, len(tmp_val_loader)
             # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_val_loader:
-            for raw, labels, mask, affinity, point_map, gt_lsd in tmp_val_loader:
+            for raw, labels, mask, affinity, point_map in tmp_val_loader:
                 # raw = torch.as_tensor(raw,dtype=torch.float, device= device) #(batch, 1, height, width, depth)
                 # point_map = torch.as_tensor(point_map, dtype=torch.float, device=device) #(batch, height, width, depth)
                 # mask = torch.as_tensor(mask, dtype=torch.float, device=device) #(batch, 2, height, width, depth)
@@ -616,7 +617,7 @@ def trainer(log_dir):
             if Best_val_loss > val_loss:
                 Best_val_loss = val_loss
                 Best_epoch = epoch
-                torch.save(model.state_dict(), '{}/Best_in_val.model'.format(log_dir))
+                torch.save(model.state_dict(), '{}/Best_in_val.model'.format(log_dir_))
                 no_improve_count = 0
             else:
                 no_improve_count += 1
@@ -642,7 +643,7 @@ def trainer(log_dir):
                 logging.info("Early stop!")
                 break
 
-    torch.save(model.module.state_dict(), f'{log_dir}/final.model')
+    torch.save(model.module.state_dict(), f'{log_dir_}/final.model')
     del model, optimizer, activation
     torch.cuda.empty_cache()
     gc.collect()
@@ -652,7 +653,7 @@ if __name__ == '__main__':
     ##设置超参数
     training_epochs = 10000
     learning_rate = 1e-4
-    batch_size = 32
+    batch_size = 40
     # Save_Name = 'segEM_3d(hemi+fib25+cremi)'
     # Save_Name = 'segEM_3d(hemi+fib25)faster_wloss3({})'.format(WEIGHT_LOSS_AFFINITY)
 
@@ -708,6 +709,6 @@ if __name__ == '__main__':
     log_dir = './output/log/segEM_3d(ninanjie)-prompt'
     os.makedirs(log_dir, exist_ok=True)
     for WEIGHT_LOSS1, WEIGHT_LOSS2, WEIGHT_LOSS3 in (
-        [10, 1, 1], [1, 10, 1], [1, 1, 10]
+        [10, 1, 1], [1, 10, 10], [1, 1, 10]
     ):
-        trainer()
+        trainer(log_dir)

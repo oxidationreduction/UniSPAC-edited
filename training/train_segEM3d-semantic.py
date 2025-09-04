@@ -1,6 +1,7 @@
 import gc
 import itertools
 import multiprocessing
+import sys
 from collections import OrderedDict
 
 import cv2
@@ -46,7 +47,7 @@ def set_seed(seed=19260817):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministics = True
 
-    
+
 ####ACRLSD模型
 class ACRLSD(torch.nn.Module):
     def __init__(
@@ -98,7 +99,8 @@ class segEM_2d(torch.nn.Module):
         ##For affinity prediction
         self.model_affinity = ACRLSD()
         # model_path = './output/checkpoints/ACRLSD_2D(hemi+fib25+cremi)_Best_in_val.model' 
-        model_path = './output/checkpoints/ACRLSD_2D(ninanjie)_semantic_Best_in_val.model'
+        model_path = ('/home/liuhongyu2024/Documents/UniSPAC-edited/'
+                      'training/output/checkpoints/ACRLSD_2D(ninanjie)_semantic_Best_in_val.model')
         weights = torch.load(model_path, map_location=torch.device('cuda'))
         self.model_affinity.load_state_dict(remove_module(weights))
         for param in self.model_affinity.parameters():
@@ -194,7 +196,7 @@ class segEM_3d(torch.nn.Module):
         self.model_mask_2d = segEM_2d()
         # model_path = './output/checkpoints/segEM2d(hemi+fib25+cremi)_Best_in_val.model' 
         # model_path = './output/checkpoints/segEM2d(hemi+fib25)faster_wloss3({})_Best_in_val.model'.format(WEIGHT_LOSS_AFFINITY)
-        model_path = './output/segEM2d(ninanjie)_semantic/1.0-1.0-2.0/1-4-3-7/segEM2d(ninanjie)_semantic-576.model'
+        model_path = './output/log/segEM2d(ninanjie)_semantic-prompt/1.0-5.0-5.0/1-1-1-1/Best_in_val.model'
         weights = torch.load(model_path,map_location=torch.device('cuda'))
         self.model_mask_2d.load_state_dict(remove_module(weights))
         for param in self.model_mask_2d.parameters():
@@ -369,7 +371,7 @@ def weighted_model_step(model, optimizer, input_image, input_prompt, gt_semantic
         loss.backward()
         optimizer.step()
     else:
-        y_probs = aftercare(torch.argmax(y_probs, dim=1) + 0.)
+        y_probs = aftercare(torch.argmax(y_probs.cpu(), dim=1) + 0.)
 
     return loss, y_probs, losses
 
@@ -388,17 +390,13 @@ def trainer(pos_weight, WEIGHT_LOSSES):
     logger = logging.getLogger()
     logger.handlers.clear()
     logger.setLevel(logging.INFO)
-    log_dir = f'./output/log/{Save_Name}/{"-".join([str(int(_)) for _ in pos_weight])}'
+    log_dir = f'./output/log/segEM_3d(ninanjie)_semantic-prompt/{"-".join([str(int(_)) for _ in WEIGHT_LOSSES])}'
     if os.path.exists(log_dir):
         return
 
     os.makedirs(log_dir)
-    try:
-        os.remove(f'{log_dir}/*.0')
-    except:
-        pass
-    logfile = '{}/log_{}.txt'.format(log_dir, Save_Name)
-    csvfile = '{}/log_{}.csv'.format(log_dir, Save_Name)
+    logfile = '{}/log.txt'.format(log_dir)
+    csvfile = '{}/log.csv'.format(log_dir)
     writer = SummaryWriter(log_dir=log_dir)
     fh = logging.FileHandler(logfile, mode='a')
     fh.setLevel(logging.DEBUG)
@@ -496,31 +494,31 @@ def trainer(pos_weight, WEIGHT_LOSSES):
             val_desc = f'VOI: {voi_val:.5f}, best VOI: {Best_voi:.5f}'
             analysis.loc[len(analysis)] = [bce_, dice_, affinity_, voi_val]
 
-            visualize_and_save_mask(raw, pred, mode='seg_only', idx=epoch, writer=writer)
-            visualize_and_save_mask(raw, pred, mode='normal', idx=epoch, writer=writer)
+            visualize_and_save_mask(raw, pred, mode='visual/seg_only', idx=epoch, writer=writer)
+            visualize_and_save_mask(raw, pred, mode='visual/normal', idx=epoch, writer=writer)
 
             ###################Compare###################
             if Best_val_loss > val_loss:
                 Best_val_loss = val_loss
                 Best_epoch = epoch
-                torch.save(model.state_dict(), '{}/{}_Best_in_val.model'.format(log_dir, Save_Name))
+                torch.save(model.state_dict(), '{}/Best_in_val.model'.format(log_dir))
                 no_improve_count = 0
             else:
                 no_improve_count += 1
 
-            if voi_val > 0.9 and Best_voi > voi_val:
+            if voi_val > 0.8 and Best_voi > voi_val:
                 Best_voi = voi_val
-                torch.save(model.state_dict(), '{}/{}_Best_voi.model'.format(log_dir, Save_Name))
+                torch.save(model.state_dict(), '{}/Best_voi.model'.format(log_dir))
                 no_improve_count = 0
 
             pbar.update(1)
             ##Record
             logging.info("Epoch {}: val_loss = {:.6f},with best val_loss = {:.6f} in epoch {}".format(
                 epoch, val_loss, Best_val_loss, Best_epoch))
-            writer.add_scalar('loss', val_loss, epoch)
-            writer.add_scalar('bce_loss', bce_, epoch)
-            writer.add_scalar('diceloss', dice_, epoch)
-            writer.add_scalar('affinity_loss', affinity_, epoch)
+            writer.add_scalar('loss/val', val_loss, epoch)
+            writer.add_scalar('loss/bce', bce_, epoch)
+            writer.add_scalar('loss/dice', dice_, epoch)
+            writer.add_scalar('loss/affinity', affinity_, epoch)
             writer.add_scalar('VOI', voi_val, epoch)
             analysis.to_csv(csvfile)
 
@@ -529,7 +527,7 @@ def trainer(pos_weight, WEIGHT_LOSSES):
                 logging.info("Early stop!")
                 break
 
-    torch.save(model.module.state_dict(), f'{log_dir}/{Save_Name}_final.model')
+    torch.save(model.module.state_dict(), f'{log_dir}/final.model')
     del model, optimizer, activation
     torch.cuda.empty_cache()
     gc.collect()
@@ -543,23 +541,17 @@ def trainer_cellmask(pos_weight, WEIGHT_LOSSES):
     # ###一机多卡设置
     model = nn.DataParallel(model, device_ids=device_ids)  # 并行使用
 
-    Save_Name = f'semantic-cellmask-segEM_3d_{crop_size}_{"-".join([str(_) for _ in WEIGHT_LOSSES])}'
-
     ##创建log日志
     logger = logging.getLogger()
     logger.handlers.clear()
     logger.setLevel(logging.INFO)
-    log_dir = f'./output/log/semantic_cellmask/{Save_Name}/{"-".join([str(int(_)) for _ in pos_weight])}'
+    log_dir = f'./output/log/segEM_3d_semantic_cellmask-prompt/{"-".join([str(int(_)) for _ in WEIGHT_LOSSES])}'
     if os.path.exists(log_dir):
         return
 
     os.makedirs(log_dir)
-    try:
-        os.remove(f'{log_dir}/*.0')
-    except:
-        pass
-    logfile = '{}/log_{}.txt'.format(log_dir, Save_Name)
-    csvfile = '{}/log_{}.csv'.format(log_dir, Save_Name)
+    logfile = '{}/log.txt'.format(log_dir)
+    csvfile = '{}/log.csv'.format(log_dir)
     writer = SummaryWriter(log_dir=log_dir)
     fh = logging.FileHandler(logfile, mode='a')
     fh.setLevel(logging.DEBUG)
@@ -590,7 +582,7 @@ def trainer_cellmask(pos_weight, WEIGHT_LOSSES):
     Best_val_loss = 100000
     Best_voi = 100000
     Best_epoch = 0
-    early_stop_count = 50
+    early_stop_count = 30
     no_improve_count = 0
     with tqdm(total=training_epochs) as pbar:
         analysis = pd.DataFrame(columns=['bce', 'dice', 'affinity', 'voi'])
@@ -637,7 +629,7 @@ def trainer_cellmask(pos_weight, WEIGHT_LOSSES):
                     loss_value, pred, losses = weighted_model_step(model, optimizer, raw, point_map, labels, affinity,
                                                                    activation, pos_weight, WEIGHT_LOSSES, train_step=False)
 
-                    binary_y_pred = np.asarray(pred.cpu(), dtype=np.uint8).flatten()
+                    binary_y_pred = np.asarray(pred, dtype=np.uint8).flatten()
                     binary_gt_mask = np.asarray(mask.cpu(), dtype=np.uint8).flatten()
 
                     voi_val += calculate_multi_class_voi(binary_y_pred, binary_gt_mask)
@@ -658,22 +650,22 @@ def trainer_cellmask(pos_weight, WEIGHT_LOSSES):
             analysis.loc[len(analysis)] = [bce_, dice_, affinity_, voi_val]
 
             cellmasked_raw = cellmasked_raw.cpu()
-            visualize_and_save_mask(raw, pred, mode='seg_only', idx=epoch, writer=writer)
-            visualize_and_save_mask(raw, pred, mode='normal', idx=epoch, writer=writer)
-            visualize_and_save_mask(cellmasked_raw, pred, mode='cellmasked', idx=epoch, writer=writer)
+            visualize_and_save_mask(raw, pred, mode='visual/seg_only', idx=epoch, writer=writer)
+            visualize_and_save_mask(raw, pred, mode='visual/normal', idx=epoch, writer=writer)
+            visualize_and_save_mask(cellmasked_raw, pred, mode='visual/cellmasked', idx=epoch, writer=writer)
 
             ###################Compare###################
             if Best_val_loss > val_loss:
                 Best_val_loss = val_loss
                 Best_epoch = epoch
-                torch.save(model.state_dict(), '{}/{}_Best_in_val.model'.format(log_dir, Save_Name))
+                torch.save(model.state_dict(), '{}/Best_in_val.model'.format(log_dir))
                 no_improve_count = 0
             else:
                 no_improve_count += 1
 
             if epoch > 20 and voi_val > 0.65 and Best_voi > voi_val:
                 Best_voi = voi_val
-                torch.save(model.state_dict(), '{}/{}_Best_voi.model'.format(log_dir, Save_Name))
+                torch.save(model.state_dict(), '{}/Best_voi.model'.format(log_dir))
                 no_improve_count = 0
 
             pbar.update(1)
@@ -681,10 +673,10 @@ def trainer_cellmask(pos_weight, WEIGHT_LOSSES):
             ##Record
             logging.info("Epoch {}: val_loss = {:.6f},with best val_loss = {:.6f} in epoch {}".format(
                 epoch, val_loss, Best_val_loss, Best_epoch))
-            writer.add_scalar('loss', val_loss, epoch)
-            writer.add_scalar('bce_loss', bce_, epoch)
-            writer.add_scalar('diceloss', dice_, epoch)
-            writer.add_scalar('affinity_loss', affinity_, epoch)
+            writer.add_scalar('loss/val', val_loss, epoch)
+            writer.add_scalar('loss/bce', bce_, epoch)
+            writer.add_scalar('loss/dice', dice_, epoch)
+            writer.add_scalar('loss/affinity', affinity_, epoch)
             writer.add_scalar('VOI', voi_val, epoch)
             analysis.to_csv(csvfile)
 
@@ -693,14 +685,14 @@ def trainer_cellmask(pos_weight, WEIGHT_LOSSES):
                 logging.info("Early stop!")
                 break
 
-    torch.save(model.module.state_dict(), f'{log_dir}/{Save_Name}_final.model')
+    torch.save(model.module.state_dict(), f'{log_dir}/final.model')
     del model, optimizer, activation
     torch.cuda.empty_cache()
     gc.collect()
 
 
 def _load_datasets(dataset_name_, crop_size_, crop_xyz_, a, b, c):
-    return load_3d_semantic_dataset(dataset_name_, raw_dir='raw', label_dir='export', from_temp=False, require_lsd=False,
+    return load_3d_semantic_dataset(dataset_name_, raw_dir='raw', label_dir='export', from_temp=True, require_lsd=False,
                                  crop_size=crop_size_, crop_xyz=crop_xyz_, chunk_position=[a, b, c])
 
 
@@ -708,7 +700,7 @@ if __name__ == '__main__':
     ##设置超参数
     training_epochs = 10000
     learning_rate = 2e-4
-    batch_size = 30
+    batch_size = 42
     # Save_Name = 'segEM_3d(hemi+fib25+cremi)'
     # Save_Name = 'segEM_3d(hemi+fib25)faster_wloss3({})'.format(WEIGHT_LOSS_AFFINITY)
 
@@ -716,7 +708,7 @@ if __name__ == '__main__':
 
     ###创建模型
     # set device
-    os.environ['CUDA_VISIBLE_DEVICES'] = '4,5,3'  # 设置所有可以使用的显卡，共计四块
+    os.environ['CUDA_VISIBLE_DEVICES'] = '4,1,5,0'  # 设置所有可以使用的显卡，共计四块
     device_ids = [i for i in range(len(os.environ['CUDA_VISIBLE_DEVICES'].split(',')))] #选中显卡
     # device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -759,6 +751,6 @@ if __name__ == '__main__':
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False,
                             collate_fn=collate_fn_3D_ninanjie_Train)
             
-    for WEIGHT_LOSSES in ([1, 10, 1], [10, 1, 1], [1, 1, 10]):
-        for label_weights in [[1., 16., 10., 50.], [1., 8., 5., 25.], [1., 4., 3., 7.], [1., 1., 1., 1.]]:
+    for WEIGHT_LOSSES in ([10, 10, 1], [10, 1, 1], [1, 10, 1]):
+        for label_weights in [[1., 1., 1., 1.]]:
             trainer_cellmask(label_weights, WEIGHT_LOSSES)

@@ -80,6 +80,7 @@ def load_3d_semantic_dataset(dataset_name: str, raw_dir=None, label_dir=None, fr
                  f'{"".join((str(i) for i in crop_xyz))}_{"".join((str(i) for i in chunk_position))}')
     Dataset_3d = Dataset_3D_semantic_Train_GPU_cellmask if 'cellmask' in dataset_name else Dataset_3D_semantic_Train_GPU
     dataset_name = dataset_name.replace('_3d', '').replace('_cellmask', '')
+
     if os.path.exists(os.path.join(ninanjie_save, temp_name)) and from_temp:
         train_dataset = joblib.load(os.path.join(ninanjie_save, temp_name))
     else:

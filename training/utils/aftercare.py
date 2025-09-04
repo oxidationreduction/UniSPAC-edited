@@ -146,7 +146,7 @@ def visualize_and_save_mask(raw: torch.Tensor, segmentation: torch.Tensor, idx=0
         raise AssertionError('unexpected raw shape')
 
     # 处理模式为'seg_only'的情况
-    if mode == 'seg_only':
+    if 'seg_only' in mode:
         mask = segmentation > 0
         raw = raw * mask
 
