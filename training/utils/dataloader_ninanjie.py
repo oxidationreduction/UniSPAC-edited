@@ -97,6 +97,8 @@ def load_test_dataset(dataset_name: str, raw_dir='raw', label_dir='label', from_
     temp_name = (f'test_{dataset_name}_{from_temp}_{crop_size}_{"".join((str(i) for i in crop_xyz))}_'
                  f'{"".join((str(i) for i in chunk_position))}_{semantic_class_num}')
     DATASET = Dataset_3D_ninanjie_Train if '3d' in dataset_name.lower() else Dataset_2D_ninanjie_Test
+    dataset_name = dataset_name.replace('_3d', '').replace('_cellmask', '')
+
     if os.path.exists(os.path.join(ninanjie_save, temp_name)) and from_temp:
         print(f"Load {dataset_name} from disk...")
         test_dataset = joblib.load(os.path.join(ninanjie_save, temp_name))
@@ -104,6 +106,22 @@ def load_test_dataset(dataset_name: str, raw_dir='raw', label_dir='label', from_
         test_dataset = DATASET(data_dir=os.path.join(ninanjie_data, 'train'), batch_num=dataset_name,
                                raw_dir=raw_dir, label_dir=label_dir, class_num=semantic_class_num,
                                crop_size=crop_size, crop_xyz=crop_xyz, chunk_position=chunk_position)
+        joblib.dump(test_dataset, os.path.join(ninanjie_save, temp_name))
+    return test_dataset
+
+
+def load_3d_predict_dataset(dataset_name: str, raw_dir='raw_2', label_dir='binary_2', from_temp=True,
+                            crop_xyz=None, chunk_position=None):
+    temp_name = f'predict_{dataset_name}_{"".join((str(i) for i in crop_xyz))}_{"".join((str(i) for i in chunk_position))}'
+
+    if os.path.exists(os.path.join(ninanjie_save, temp_name)) and from_temp:
+        print(f"Load {dataset_name} from disk...")
+        test_dataset = joblib.load(os.path.join(ninanjie_save, temp_name))
+    else:
+        test_dataset = Dataset_3D_ninanjie_Predict_GPU(data_dir=os.path.join(ninanjie_data, 'train'),
+                                                       batch_num=dataset_name,
+                                                       raw_dir=raw_dir, label_dir=label_dir,
+                                                       crop_xyz=crop_xyz, chunk_position=chunk_position)
         joblib.dump(test_dataset, os.path.join(ninanjie_save, temp_name))
     return test_dataset
 
@@ -544,7 +562,7 @@ class Dataset_2D_ninanjie_Train(Dataset):
             box = [np.min(x_list), np.min(y_list), np.max(x_list), np.max(y_list)]
             Boxes.append(box)
 
-        ##Get Points(-) 
+        ##Get Points(-)
         for label in labels_exclude:
             mask_label = (labels == label)
             idx_label = np.where(mask_label)
@@ -1399,7 +1417,6 @@ class Dataset_2D_ninanjie_Origin(Dataset):
         return self.data_pack[idx]
 
 
-
 def collate_fn_2D_fib25_Train(batch):
     raw = np.array([item[0] for item in batch]).astype(np.float32)
 
@@ -1448,13 +1465,11 @@ def collate_fn_2D_cellmask_Train(batch):
     else:
         return raw, cellmasked_raw, labels, point_map, mask, affinity, None
 
-
 def collate_fn_2D_fib25_Test(batch):
     raw = np.array([item[0] for item in batch]).astype(np.float32)
     point_map = np.array([item[1] for item in batch]).astype(np.float32)
     gt_label = np.array([item[2] for item in batch]).astype(np.int32)
     return raw, point_map, gt_label
-
 
 def collate_fn_2D_ninanjie_Origin(batch):
     raw = np.array([item[0] for item in batch]).astype(np.float32)
@@ -2221,6 +2236,318 @@ class Dataset_3D_ninanjie_Train_GPU(Dataset):
 
         return total_matrix.astype(np.float32)
 
+
+class Dataset_3D_ninanjie_Predict_GPU(Dataset):
+    def __init__(
+            self,
+            data_dir='./data/ninanjie',
+            batch_num='first',
+            raw_dir=None,
+            label_dir=None,
+            num_slices=8,
+            crop_xyz=None,
+            chunk_position=None,
+            **kwargs):
+
+        if crop_xyz is None:
+            crop_xyz = [2, 2, 1]
+        if chunk_position is None:
+            chunk_position = [0, 0, 0]
+        self.device = torch.device('cpu')
+
+        # 加载原始数据
+        self.images = []
+        self.masks = []
+        self.idxs = []
+
+        raw_dir = os.path.join(data_dir, batch_num, raw_dir if raw_dir else 'raw')
+        labels_dir = os.path.join(data_dir, batch_num, label_dir if label_dir else 'label')
+
+        # 计算z轴切割范围
+        z_files = sorted(os.listdir(raw_dir))
+        z_start = chunk_position[2] * len(z_files) // crop_xyz[2]
+        z_end = (chunk_position[2] + 1) * len(z_files) // crop_xyz[2]
+        z_files = z_files[z_start:z_end]
+
+        # 多进程加载图像
+        with Pool(os.cpu_count() >> 1) as multi_pool:
+            results = []
+            for image in z_files:
+                results.append(
+                    multi_pool.apply_async(_add_image,
+                                           args=(raw_dir, labels_dir, image, crop_xyz[:2], chunk_position[:2])))
+
+            for result in results:
+                raw_img, label_img = result.get()
+                if raw_img is not None and label_img is not None:
+                    self.images.append(raw_img)
+                    self.masks.append(label_img)
+
+        self.num_slices = len(self.images) if num_slices == 0 or num_slices > len(self.images) else num_slices
+        # 转换为numpy数组并分割训练/验证集
+        self.images = np.asarray(self.images)  # 形状: (N, H, W)
+        self.masks = np.asarray(self.masks, dtype=np.int32)  # 形状: (N, H, W)
+
+        # 预处理并转移到显存
+        self._preprocess_and_move_to_gpu()
+
+        # 生成有效的切片索引（只保留有标注的切片）
+        self.idxs = [
+            idx for idx in range(self.images.shape[0] - self.num_slices + 1)
+            if np.any(self.masks[idx:idx + self.num_slices])
+        ]
+        if not self.idxs:
+            raise ValueError("invalid data")
+
+    def _preprocess_and_move_to_gpu(self):
+        """预处理数据并将其转移到GPU显存（修改get_prompt调用和point_map生成逻辑）"""
+        pbar = tqdm.tqdm(total=4, leave=False)
+        # 转置为 (H, W, N) 并归一化
+        raw = self.images.transpose(1, 2, 0)  # (H, W, N)
+        raw = self.normalize(raw)
+        pbar.set_description("raw normalized")
+        pbar.update(1)
+
+        # 处理标签
+        labels = self.masks.transpose(1, 2, 0)  # (H, W, N)
+        # labels = self.erode(labels, iterations=1, border_value=1)
+        pbar.set_description("label eroded")
+        pbar.update(1)
+
+        raw, labels = self.augment_data(raw, labels)
+
+        self.Points_pos, self.Points_lab, self.Boxes, self.mask_3D = self.get_prompt(labels)
+        self.mask_3D = torch.tensor(self.mask_3D, dtype=torch.uint8, device=self.device)
+        H, W = labels.shape[:2]
+        self.point_map = torch.tensor(
+            self.generate_gaussian_matrix(self.Points_pos, self.Points_lab, H, W, theta=30),
+            dtype=torch.float32, device=self.device
+        )
+        pbar.set_description("point_map generated")
+        pbar.update(1)
+
+        raw = torch.tensor(raw, dtype=torch.float32, device=self.device)
+        labels = torch.tensor(labels, dtype=torch.int32, device=self.device)
+        self.raw, self.labels = raw.unsqueeze(0), labels.unsqueeze(0)
+        pbar.set_description("raw & label to cuda")
+        pbar.update(1)
+        pbar.close()
+
+    def _compute_affinity(self, labels):
+        """预先计算亲和力矩阵"""
+        label_shift = np.pad(labels, ((0, 1), (0, 1), (0, 1)), 'edge')
+
+        affinity_x = np.expand_dims(((labels - label_shift[1:, :-1, :-1]) != 0) + 0, axis=0)
+        affinity_y = np.expand_dims(((labels - label_shift[:-1, 1:, :-1]) != 0) + 0, axis=0)
+        affinity_z = np.expand_dims(((labels - label_shift[:-1, :-1, 1:]) != 0) + 0, axis=0)
+
+        background = (labels == 0)
+        affinity_x[0][background] = 1
+        affinity_y[0][background] = 1
+        affinity_z[0][background] = 1
+
+        return np.concatenate([affinity_x, affinity_y, affinity_z], axis=0).astype('float32')
+
+    def __len__(self):
+        return len(self.idxs)
+
+    def __getitem__(self, idx):
+        """直接从显存切片获取数据，避免重复存储"""
+        start = self.idxs[idx]
+        end = start + self.num_slices
+
+        # 切片获取8层数据 (H, W, [start:end])
+        raw_slice = self.raw[..., start:end]
+
+        # 标签和其他数据同样切片
+        labels_slice = self.labels[..., start:end]
+        mask_slice = self.mask_3D[..., start:end]
+        point_map_slice = self.point_map
+
+        # 组装返回数据
+        result = [
+            raw_slice,
+            labels_slice,
+            mask_slice,
+            point_map_slice
+        ]
+
+        return result
+
+    def augment_data(self, raw, mask):
+        H, W = raw.shape[:2]
+        pad_to_eight = lambda x: ((x >> 3) + 1) << 3
+        H, W = pad_to_eight(H), pad_to_eight(W)
+        transform = A.Compose([
+            A.PadIfNeeded(
+                min_height=H,
+                min_width=W,
+                p=1,
+                border_mode=0)
+        ])  ## 数据增强
+
+        transformed = transform(image=raw, mask=mask)
+
+        raw, mask = transformed['image'], transformed['mask']
+
+        return raw, mask  ## 图像和标签的维度都是： padding * padding
+
+    def augment_data_gpu(self, raw, mask, padding):
+        """GPU上的数据增强（完全匹配albumentations原功能）"""
+        # 原始数据形状: raw为(1, H, W, D), mask为(H, W, D)
+        # 1. 随机裁剪到crop_size（与A.RandomCrop一致）
+        raw, mask = raw.unsqueeze(0), mask.unsqueeze(0)
+        h, w = raw.shape[1], raw.shape[2]
+        if h > self.crop_size and w > self.crop_size:
+            # 随机生成裁剪起点
+            top = torch.randint(0, h - self.crop_size, (1,), device=self.device).item()
+            left = torch.randint(0, w - self.crop_size, (1,), device=self.device).item()
+            # 执行裁剪
+            raw = raw[:, top:top + self.crop_size, left:left + self.crop_size, :]
+            mask = mask[top:top + self.crop_size, left:left + self.crop_size, :]
+
+        # 2. 填充到padding大小（与A.PadIfNeeded一致）
+        current_h, current_w = raw.shape[1], raw.shape[2]
+        pad_h = max(0, padding - current_h)
+        pad_w = max(0, padding - current_w)
+
+        if pad_h > 0 or pad_w > 0:
+            # 计算上下左右填充量（与albumentations默认相同，均匀填充）
+            pad_top = pad_h // 2
+            pad_bottom = pad_h - pad_top
+            pad_left = pad_w // 2
+            pad_right = pad_w - pad_left
+
+            # 对raw和mask进行填充（border_mode=0对应常数填充，默认为0）
+            raw = torch.nn.functional.pad(
+                raw,
+                (0, 0, pad_left, pad_right, pad_top, pad_bottom, 0, 0),  # 注意PyTorch的pad顺序是反向的
+                mode='constant',
+                value=0.0
+            )
+            mask = torch.nn.functional.pad(
+                mask,
+                (0, 0, pad_left, pad_right, pad_top, pad_bottom),
+                mode='constant',
+                value=0
+            )
+
+        # 3. 随机水平翻转（与A.HorizontalFlip一致）
+        if torch.rand(1, device=self.device) < 0.3:
+            raw = torch.flip(raw, dims=[2])  # 水平翻转W维度
+            mask = torch.flip(mask, dims=[2])
+
+        # 4. 随机垂直翻转（与A.VerticalFlip一致）
+        if torch.rand(1, device=self.device) < 0.3:
+            raw = torch.flip(raw, dims=[1])  # 垂直翻转H维度
+            mask = torch.flip(mask, dims=[1])
+
+        # 5. 随机旋转90度（与A.RandomRotate90一致）
+        if torch.rand(1, device=self.device) < 0.3:
+            # 随机选择旋转次数（0-3次，每次90度）
+            k = torch.randint(1, 4, (1,), device=self.device).item()
+            raw = torch.rot90(raw, k=k, dims=[1, 2])  # 在H和W维度旋转
+            mask = torch.rot90(mask, k=k, dims=[0, 1])
+
+        # 6. 随机转置（与A.Transpose一致）
+        if torch.rand(1, device=self.device) < 0.3:
+            raw = torch.transpose(raw, 1, 2)  # 交换H和W维度
+            mask = torch.transpose(mask, 0, 1)
+
+        # 7. 随机亮度对比度调整（与A.RandomBrightnessContrast一致）
+        if torch.rand(1, device=self.device) < 0.3:
+            # 亮度调整范围: [-0.2, 0.2]，对比度调整范围: [-0.2, 0.2]（与albumentations默认一致）
+            brightness_factor = 1.0 + torch.randn(1, device=self.device) * 0.1  # 更集中的分布
+            brightness_factor = torch.clamp(brightness_factor, 0.8, 1.2)
+
+            contrast_factor = 1.0 + torch.randn(1, device=self.device) * 0.1
+            contrast_factor = torch.clamp(contrast_factor, 0.8, 1.2)
+
+            # 先调整亮度
+            raw = raw * brightness_factor
+            # 再调整对比度（使用均值中心化）
+            mean = raw.mean()
+            raw = (raw - mean) * contrast_factor + mean
+            # 确保值仍在[0,1]范围内（归一化后）
+            raw = torch.clamp(raw, 0.0, 1.0)
+
+        return raw, mask
+
+    def erode(self, labels, iterations, border_value):
+        foreground = np.zeros_like(labels, dtype=bool)
+        for label in np.unique(labels):
+            if label == 0:
+                continue
+            label_mask = labels == label
+            eroded_mask = binary_erosion(label_mask, iterations=iterations, border_value=border_value)
+            foreground = np.logical_or(eroded_mask, foreground)
+        background = np.logical_not(foreground)
+        labels[background] = 0
+        return labels
+
+    def get_padding(self, crop_size, padding_size):
+        q = int(crop_size / padding_size)
+        return padding_size * (q + 1) if crop_size % padding_size != 0 else crop_size
+
+    def normalize(self, data):
+        return (data - np.min(data)) / (np.max(data) - np.min(data) + 1e-8).astype(np.float32)
+
+    def get_prompt(self, labels):
+        Points_pos = list()  # 点坐标 [x, y]
+        Points_lab = list()  # 点标签（1为正样本，0为负样本）
+        Boxes = list()       # 目标框 [min_x, min_y, max_x, max_y]
+
+        mask = (labels != 0)  # 非背景区域全为有效
+        return Points_pos, Points_lab, Boxes, mask
+
+    def generate_gaussian_matrix(self, Points_pos, Points_lab, H, W, theta=10):
+        """
+        基于点坐标和标签生成高斯矩阵
+        Args:
+            Points_pos: 点坐标列表 [[x1,y1], [x2,y2], ...]
+            Points_lab: 点标签列表 [1, 0, ...]（1正0负）
+            H: 矩阵高度（对应labels的H维度）
+            W: 矩阵宽度（对应labels的W维度）
+            theta: 高斯分布标准差（控制高斯核大小）
+        Returns:
+            total_matrix: 叠加后的高斯矩阵（H, W）
+        """
+        # 无点时返回全1矩阵（兼容原逻辑）
+        if not Points_pos or len(Points_pos) == 0:
+            return np.ones((H, W), dtype=np.float32)
+
+        total_matrix = np.zeros((H, W), dtype=np.float32)
+        record_list = list()  # 避免重复处理同一坐标的点
+
+        # 遍历每个点生成高斯分布并叠加
+        for n, (X, Y) in enumerate(Points_pos):
+            # 跳过重复点
+            if (X, Y) in record_list:
+                continue
+            record_list.append((X, Y))
+
+            # 生成坐标网格（x对应W维度，y对应H维度）
+            x_grid, y_grid = np.meshgrid(np.arange(W), np.arange(H))
+            pos_grid = np.dstack((x_grid, y_grid))  # (H, W, 2)：每个像素的(x,y)坐标
+
+            # 生成以(X,Y)为中心、theta为标准差的二维高斯分布
+            gaussian_dist = multivariate_normal(mean=[X, Y], cov=[[theta, 0], [0, theta]])
+            gaussian_matrix = gaussian_dist.pdf(pos_grid)  # (H, W)：每个像素的高斯值
+
+            # 归一化高斯矩阵（最大值为1）
+            max_val = np.max(gaussian_matrix)
+            if max_val > 0:  # 避免除以0（理论上不会发生）
+                gaussian_matrix = gaussian_matrix / max_val
+
+            # 按点标签调整符号（正样本+1，负样本-1）
+            weight = (Points_lab[n] * 2 - 1)  # 1→1，0→-1
+            total_matrix += gaussian_matrix * weight
+
+        # 若全为负样本点，调整矩阵范围（避免全负影响后续计算）
+        if np.max(Points_lab) == 0:
+            total_matrix = total_matrix * 2 + 1  # 将[-1,0]映射到[-1,1]
+
+        return total_matrix.astype(np.float32)
 
 class Dataset_3D_semantic_Train_GPU(Dataset):
     def __init__(
@@ -3116,7 +3443,6 @@ class Dataset_3D_semantic_Train_GPU_cellmask(Dataset):
             total_matrix = total_matrix * 2 + 1  # 将[-1,0]映射到[-1,1]
 
         return total_matrix.astype(np.float32)
-
 
 
 def collate_fn_3D_ninanjie_Train(batch):

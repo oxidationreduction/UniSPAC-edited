@@ -41,12 +41,12 @@ class ImageViewer(QMainWindow):
 
         ##Model setting
         # self.device = 'cpu'
-        self.device = 'cuda'
+        self.device = 'cuda:3'
         self.segNeuro2d_model = 'segEM2d(hemi+fib25)_Best_in_val.model'
         self.segNeuro3d_model = 'segEM3d_trace(hemi+fib25)_Best_in_val.model'
 
         self.crop_size = 512
-        self.slices_tracking = 32
+        self.slices_tracking = 8
 
         self.initUI()
         self.initModels()
@@ -408,12 +408,15 @@ class ImageViewer(QMainWindow):
         y_mask = (y_mask > 0.5) + 0
         y_mask = y_mask.squeeze().detach().cpu().numpy().transpose(2, 0, 1)
         segmentation = label(y_mask)
+        print(np.unique(segmentation))
         segmentation_color = self.create_lut(segmentation)
 
         import imageio
         print(segmentation_color.shape)
         # np.save('./output/y_seg3d_color.npy',y_seg3d_color)
-        imageio.volwrite('./output/roi1_slices0-31.tiff', segmentation_color)
+        for idx in range(self.slices_tracking):
+            layer_color = segmentation_color[idx, ...].squeeze()
+            imageio.imwrite(f'./output/roi1_slices-{idx}.tiff', layer_color)
         self.output_text.append("Tracing ends!")
 
 

@@ -1,3 +1,4 @@
+import cv2
 import numpy as np
 import torch
 from scipy.ndimage import binary_fill_holes
@@ -55,7 +56,7 @@ def aftercare(y_mask: torch.Tensor):
     result = torch.stack(result, dim=0)
 
     # 确保输出仍是0和1的二进制张量
-    return (np.asarray(result) > 0.5) + 0
+    return np.asarray(result.cpu())
 
 
 def process_single_layer(layer: torch.Tensor, device, kernel):
@@ -63,29 +64,20 @@ def process_single_layer(layer: torch.Tensor, device, kernel):
     layer = np.asarray(layer.cpu())
 
     # 0. 过滤小目标
-    # num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-    #     layer, connectivity=8  # connectivity=4 表示4连通
-    # )
-    #
-    # min_size = 50
-    # filtered_array = np.zeros_like(labels, dtype=np.uint8)
-    # for i in range(1, num_labels):  # 从1开始，0是背景
-    #     area = stats[i, cv2.CC_STAT_AREA]  # 获取第i个分量的面积
-    #     if area >= min_size:
-    #         filtered_array[labels == i] = 255  # 保留大分量（设为255）
+    min_size = 50
+    labels, counts = np.unique(layer, return_counts=True)
+    label_counts = dict(zip(labels, counts))
+    layer_new = torch.zeros_like(torch.as_tensor(layer), dtype=torch.int32)
+    for label, count in label_counts.items():
+        if count > min_size:
+            mask = torch.as_tensor(binary_fill_holes(layer == label),
+                                   dtype=torch.float32, device=torch.device('cuda'))
+            mask = morphological_dilation(mask, kernel)
+            mask = morphological_erosion(mask, kernel)
+            mask = mask == 1.
+            layer_new[mask] = int(label)
 
-    # 1. 填充连通域中间的空心区域
-    filled = binary_fill_holes(layer) + 0.
-    filled = torch.as_tensor(filled, device=device, dtype=torch.float32)
-    # 2. 先膨胀再腐蚀（闭运算），圆化目标边缘
-    # 膨胀操作
-    dilated = morphological_dilation(filled, kernel)
-    # dilated = binary_dilation(filled, iterations=1, border_value=1)
-    # 腐蚀操作
-    rounded = morphological_erosion(dilated, kernel)
-    # rounded = binary_erosion(dilated, iterations=1, border_value=1)
-
-    return rounded
+    return layer_new
 
 
 def morphological_dilation(x: torch.Tensor, kernel: torch.Tensor):
