@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 
 # from torch.utils.tensorboard import SummaryWriter
 from models.unet2d import UNet2d
+from training.models.ACRLSD import ACRLSD_2D
 from utils.dataloader_ninanjie import Dataset_2D_ninanjie_Train
 from utils.dataloader_hemi_better import Dataset_2D_hemi_Train, collate_fn_2D_hemi_Train
 
@@ -29,86 +30,6 @@ def set_seed(seed=1998):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministics = True
-
-
-####ACRLSD模型
-class ACRLSD(torch.nn.Module):
-    def __init__(
-            self,
-    ):
-        super(ACRLSD, self).__init__()
-
-        # create our network, 1 input channels in the raw data
-        self.model_lsds = UNet2d(
-            in_channels=1,  # 输入的图像通道数
-            num_fmaps=12,
-            fmap_inc_factors=5,
-            downsample_factors=[[2, 2], [2, 2], [2, 2]],  # 降采样的因子
-            padding='same',
-            constant_upsample=True).to(device)
-
-        self.lsd_predict = torch.nn.Conv2d(in_channels=12, out_channels=6, kernel_size=1)  # 最终输出层的卷积操作
-
-        # create our network, 6 input channels in the lsds data and 1 input channels in the raw data
-        self.model_affinity = UNet2d(
-            in_channels=7,  # 输入的图像通道数
-            num_fmaps=12,
-            fmap_inc_factors=5,
-            downsample_factors=[[2, 2], [2, 2], [2, 2]],  # 降采样的因子
-            padding='same',
-            constant_upsample=True).to(device)
-
-        self.affinity_predict = torch.nn.Conv2d(in_channels=12, out_channels=2, kernel_size=1)  # 最终输出层的卷积操作
-
-    def forward(self, x):
-        y_lsds = self.lsd_predict(self.model_lsds(x))
-
-        y_concat = torch.cat([x, y_lsds.detach()], dim=1)
-
-        y_affinity = self.affinity_predict(self.model_affinity(y_concat))
-
-        return y_lsds, y_affinity
-
-
-####ACRLSD模型
-class segEM2d(torch.nn.Module):
-    def __init__(
-            self,
-    ):
-        super(segEM2d, self).__init__()
-
-        ##For affinity prediction
-        self.model_affinity = ACRLSD()
-        # model_path = './output/checkpoints/ACRLSD_2D(hemi+fib25+cremi)_Best_in_val.model' 
-        model_path = ('/home/liuhongyu2024/Documents/UniSPAC-edited/'
-                      'output/checkpoints/ACRLSD_2D(ninanjie)_Best_in_val.model')
-        weights = torch.load(model_path, map_location=torch.device('cpu'))
-        self.model_affinity.load_state_dict(weights)
-        for param in self.model_affinity.parameters():
-            param.requires_grad = False
-
-        # create our network, 2 input channels in the affinity data and 1 input channels in the raw data
-        self.model_mask = UNet2d(
-            in_channels=3,  # 输入的图像通道数
-            num_fmaps=12,
-            fmap_inc_factors=5,
-            downsample_factors=[[2, 2], [2, 2], [2, 2]],  # 降采样的因子
-            padding='same',
-            constant_upsample=True)
-
-        self.mask_predict = torch.nn.Conv2d(in_channels=12, out_channels=1, kernel_size=1)  # 最终输出层的卷积操作
-
-        self.sigmoid = torch.nn.Sigmoid()
-
-    def forward(self, x_raw, x_prompt):
-        y_lsds, y_affinity = self.model_affinity(x_raw)
-
-        y_concat = torch.cat([x_prompt.unsqueeze(1), y_affinity.detach()], dim=1)
-
-        y_mask = self.mask_predict(self.model_mask(y_concat))
-        y_mask = self.sigmoid(y_mask)
-
-        return y_mask, y_lsds, y_affinity
 
 
 class DiceLoss(nn.Module):
@@ -167,42 +88,17 @@ def load_dataset(dataset_name: str, split: str='train', from_temp=True):
     return train_dataset_2
 
 
-if __name__ == '__main__':
-    ##设置超参数
-    training_epochs = 10000
-    learning_rate = 1e-4
-    batch_size = 96
-    Save_Name = 'segEM2d(ninanjie)'
+def trainer(num_fmaps, fmap_inc_factors, downsample_times):
+    model_affinity = ACRLSD_2D(num_fmaps=32, fmap_inc_factors=5, downsample_times=3)
+    model_path = ('/home/liuhongyu2024/Documents/UniSPAC-edited/training/output/log/'
+                  'ACRLSD_2D(ninanjie)_all/256_32_5_3/auto_weighted/Best_in_val.model')
+    weights = torch.load(model_path, map_location=torch.device('cuda'))
+    model_affinity.load_state_dict(weights)
+    for param in model_affinity.parameters():
+        param.requires_grad = False
 
-    set_seed()
-
-    ###创建模型
-    # set device
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    torch.backends.cudnn.benchmark = True
-
-    model = segEM2d()
-    ##多卡训练
-    # 一机多卡设置
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,4'#设置所有可以使用的显卡，共计四块
-    device_ids = [0,1,4]#选中显卡
-    torch.cuda.set_device(device_ids[0])
+    model = segEM_2d(num_fmaps, fmap_inc_factors, downsample_times)
     model = nn.DataParallel(model.cuda(), device_ids=device_ids, output_device=device)
-    # model = torch.nn.DataParallel(model)  # 默认使用所有的device_ids
-
-    # model = model.to(device)
-
-    ##装载数据
-    ninanjie_data = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie/fourth'
-    ninanjie_save = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie-save'
-
-    train_dataset, val_dataset = load_dataset('first', require_xz_yz=True, from_temp=True,
-                                              crop_xyz=[3, 3, 2], chunk_position=[1, 1, 0])
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=14, pin_memory=True,
-                              drop_last=True, collate_fn=collate_fn_2D_hemi_Train)
-    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=14, pin_memory=True,
-                            collate_fn=collate_fn_2D_hemi_Train)
 
     ##创建log日志
     logger = logging.getLogger()
@@ -219,13 +115,13 @@ if __name__ == '__main__':
     logger.addHandler(ch)
 
     logging.info(f'''Starting training:
-    training_epochs:  {training_epochs}
-    Num_slices_train: {len(train_dataset)}
-    Num_slices_val:   {len(val_dataset)}
-    Batch size:       {batch_size}
-    Learning rate:    {learning_rate}
-    Device:           {device.type}
-    ''')
+        training_epochs:  {training_epochs}
+        Num_slices_train: {len(train_dataset)}
+        Num_slices_val:   {len(val_dataset)}
+        Batch size:       {batch_size}
+        Learning rate:    {learning_rate}
+        Device:           {device.type}
+        ''')
 
     ##开始训练
     # set optimizer
@@ -257,7 +153,7 @@ if __name__ == '__main__':
                 gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
                                               device=device)  # (batch, 2, height, width)
 
-                loss_value, pred = model_step(model, optimizer, raw, point_map, mask, gt_affinity, activation,
+                model_step(model, optimizer, raw, point_map, mask, gt_affinity, activation,
                                               train_step=True)
             epoch += 1
             pbar.update(1)
@@ -302,3 +198,31 @@ if __name__ == '__main__':
             if no_improve_count == early_stop_count:
                 logging.info("Early stop!")
                 break
+
+if __name__ == '__main__':
+    ##设置超参数
+    training_epochs = 10000
+    learning_rate = 1e-4
+    batch_size = 96
+    Save_Name = 'segEM2d(ninanjie)'
+    set_seed()
+
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,4'#设置所有可以使用的显卡，共计四块
+    device_ids = [0,1,4]#选中显卡
+    torch.cuda.set_device(device_ids[0])
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True
+
+    ##装载数据
+    ninanjie_data = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie/fourth'
+    ninanjie_save = '/home/liuhongyu2024/sshfs_share/liuhongyu2024/project/unispac/UniSPAC-edited/data/ninanjie-save'
+
+    train_dataset, val_dataset = load_dataset('first', require_xz_yz=True, from_temp=True,
+                                              crop_xyz=[3, 3, 2], chunk_position=[1, 1, 0])
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=14, pin_memory=True,
+                              drop_last=True, collate_fn=collate_fn_2D_hemi_Train)
+    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=14, pin_memory=True,
+                            collate_fn=collate_fn_2D_hemi_Train)
+
+

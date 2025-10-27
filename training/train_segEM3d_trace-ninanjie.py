@@ -18,6 +18,7 @@ from copy import deepcopy
 # from torch.utils.tensorboard import SummaryWriter
 from models.unet2d import UNet2d
 from models.unet3d import UNet3d
+from training.models.ACRLSD import ACRLSD_3D, remove_module
 from training.utils.aftercare import visualize_and_save_mask
 from utils.dataloader_hemi_better import Dataset_3D_hemi_Train,collate_fn_3D_hemi_Train
 from utils.dataloader_ninanjie import load_train_dataset, \
@@ -43,184 +44,16 @@ def set_seed(seed = 19260817):
     torch.backends.cudnn.deterministics = True
 
 
-####ACRLSD模型
-class ACRLSD(torch.nn.Module):
-    def __init__(
-            self,
-    ):
-        super(ACRLSD, self).__init__()
-
-        # create our network, 1 input channels in the raw data
-        self.model_lsds = UNet2d(
-            in_channels=1,  # 输入的图像通道数
-            num_fmaps=12,
-            fmap_inc_factors=5,
-            downsample_factors=[[2, 2], [2, 2], [2, 2]],  # 降采样的因子
-            padding='same',
-            constant_upsample=True)
-
-        self.lsd_predict = torch.nn.Conv2d(in_channels=12, out_channels=6, kernel_size=1)  # 最终输出层的卷积操作
-
-        # create our network, 6 input channels in the lsds data and 1 input channels in the raw data
-        self.model_affinity = UNet2d(
-            in_channels=7,  # 输入的图像通道数
-            num_fmaps=12,
-            fmap_inc_factors=5,
-            downsample_factors=[[2, 2], [2, 2], [2, 2]],  # 降采样的因子
-            padding='same',
-            constant_upsample=True)
-
-        self.affinity_predict = torch.nn.Conv2d(in_channels=12, out_channels=2, kernel_size=1)  # 最终输出层的卷积操作
-
-    def forward(self, x):
-        y_lsds = self.lsd_predict(self.model_lsds(x))
-
-        y_concat = torch.cat([x, y_lsds], dim=1)
-
-        y_affinity = self.affinity_predict(self.model_affinity(y_concat))
-
-        return y_lsds, y_affinity
-
-
-####ACRLSD模型
-class segEM_2d(torch.nn.Module):
-    def __init__(
-            self,
-    ):
-        super(segEM_2d, self).__init__()
-
-        ##For affinity prediction
-        self.model_affinity = ACRLSD()
-        # model_path = './output/checkpoints/ACRLSD_2D(hemi+fib25+cremi)_Best_in_val.model'
-        model_path = './output/checkpoints/ACRLSD_2D(ninanjie)_half_crop_Best_in_val.model'
-        weights = torch.load(model_path, map_location=torch.device('cuda:0'))
-        self.model_affinity.load_state_dict(remove_module(weights))
-        for param in self.model_affinity.parameters():
-            param.requires_grad = False
-
-        # create our network, 2 input channels in the affinity data and 1 input channels in the raw data
-        self.model_mask = UNet2d(
-            in_channels=3,  # 输入的图像通道数
-            num_fmaps=12,
-            fmap_inc_factors=5,
-            downsample_factors=[[2, 2], [2, 2], [2, 2]],  # 降采样的因子
-            padding='same',
-            constant_upsample=True)
-
-        self.mask_predict = torch.nn.Conv2d(in_channels=12, out_channels=1, kernel_size=1)  # 最终输出层的卷积操作
-
-        self.sigmoid = torch.nn.Sigmoid()
-
-    def forward(self, x_raw, x_prompt):
-        y_lsds, y_affinity = self.model_affinity(x_raw)
-
-        y_concat = torch.cat([x_prompt.unsqueeze(1), y_affinity], dim=1)
-
-        y_mask = self.mask_predict(self.model_mask(y_concat))
-        y_mask = self.sigmoid(y_mask)
-
-        return y_mask, y_lsds, y_affinity
-
-
-####ACRLSD_3d模型
-class ACRLSD_3d(torch.nn.Module):
-    def __init__(
-            self,
-    ):
-        super(ACRLSD_3d, self).__init__()
-        # d_factors = [[2,2,2],[2,2,2],[2,2,2]]  #降采样的因子
-        # in_channels=1 #输入的图像通道数
-        # num_fmaps=12
-        # fmap_inc_factor=5
-
-        # create our network, 1 input channels in the raw data
-        self.model_lsds = UNet3d(
-            in_channels=1,  # 输入的图像通道数
-            num_fmaps=12,
-            fmap_inc_factors=5,
-            downsample_factors=[[2, 2, 2], [2, 2, 2], [2, 2, 2]],  # 降采样的因子
-            padding='same',
-            constant_upsample=True)
-
-        self.lsd_predict = torch.nn.Conv3d(in_channels=12, out_channels=10, kernel_size=1)  # 最终输出层的卷积操作
-
-        # create our network, 10 input channels in the lsds data and 1 input channels in the raw data
-        self.model_affinity = UNet3d(
-            in_channels=11,  # 输入的图像通道数
-            num_fmaps=12,
-            fmap_inc_factors=5,
-            downsample_factors=[[2, 2, 2], [2, 2, 2], [2, 2, 2]],  # 降采样的因子
-            padding='same',
-            constant_upsample=True)
-
-        self.affinity_predict = torch.nn.Conv3d(in_channels=12, out_channels=3, kernel_size=1)  # 最终输出层的卷积操作
-
-    def forward(self, x):
-        y_lsds = self.lsd_predict(self.model_lsds(x))
-
-        y_concat = torch.cat([x, y_lsds.detach()], dim=1)
-
-        y_affinity = self.affinity_predict(self.model_affinity(y_concat))
-
-        return y_lsds, y_affinity
-
-
-def remove_module(state_dict):
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        name = k.replace('module.', '')  # 去掉 'module.' 前缀
-        new_state_dict[name] = v
-    return new_state_dict
-
-
-class segEM_3d_trace(torch.nn.Module):
-    def __init__(
-        self,
-    ):
-        super(segEM_3d_trace, self).__init__()
-        
-        ##For affinity prediction
-        self.model_affinity = ACRLSD_3d()
-        # model_path = './output/checkpoints/ACRLSD_3D(hemi+fib25+cremi)_Best_in_val.model' 
-        model_path = './output/log/ACRLSD_3D(ninanjie)_384/ACRLSD_3D(ninanjie)_384_Best_in_val.model'
-        weights = torch.load(model_path,map_location=torch.device('cuda'))
-        self.model_affinity.load_state_dict(remove_module(weights))
-        for param in self.model_affinity.parameters():
-            param.requires_grad = False
-            
-        # create our network, 3 input channels in the affinity data and 1 input channels in the raw data
-        self.model_mask = UNet3d(
-            in_channels=4, #输入的图像通道数
-            num_fmaps=12,
-            fmap_inc_factors=5,
-            downsample_factors=[[2,2,2],[2,2,2],[2,2,2]], #降采样的因子
-            padding='same',
-            constant_upsample=True).cuda()
-        
-        self.mask_predict = torch.nn.Conv3d(in_channels=12,out_channels=1, kernel_size=1)  #最终输出层的卷积操作
-        
-        self.sigmoid = torch.nn.Sigmoid()
-    
-    def forward(self, x_raw, gt_mask2d_slice0):
-        '''
-        x_raw: shape = (Batch * channel * dim_x * dim_y * dim_z)
-        gt_mask2d_slice0: shape = (Batch * dim_x * dim_y)
-        '''
-        # ##Get mask for slice0
-        # y_mask2d_slice0,_,_ = self.model_mask_2d(x_raw[:,:,:,:,0],x_prompt)
-        
-        ##Get affinity for raw
-        y_lsds,y_affinity = self.model_affinity(x_raw)
-        
-        #replace raw slice0
-        x_raw_new = deepcopy(x_raw)
-        x_raw_new[:,0,:,:,0] = gt_mask2d_slice0
-        y_concat = torch.cat([x_raw_new,y_affinity.detach()],dim=1)
-
-        y_mask3d = self.mask_predict(self.model_mask(y_concat))
-        y_mask3d = self.sigmoid(y_mask3d)
-
-        return y_mask3d,y_affinity,y_lsds
+def get_model_affinity_3d():
+    model_affinity = ACRLSD_3D(num_fmaps=34, fmap_inc_factor=4)
+    # model_path = './output/checkpoints/ACRLSD_3D(hemi+fib25+cremi)_Best_in_val.model'
+    model_path = ('/home/liuhongyu2024/Documents/UniSPAC-edited/training/output/log/'
+                  'ACRLSD_3D(ninanjie)_all/256_34_4_cpu/Best_in_val.model')
+    weights = torch.load(model_path, map_location=torch.device('cuda'))
+    model_affinity.load_state_dict(remove_module(weights))
+    for param in model_affinity.parameters():
+        param.requires_grad = False
+    return model_affinity.cuda()
 
     
 class DiceLoss(nn.Module):

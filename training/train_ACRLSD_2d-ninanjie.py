@@ -1,20 +1,25 @@
+import gc
+import itertools
 import logging
 import os
 import random
+import sys
 from collections import OrderedDict
 
 import joblib
 import numpy as np
 import pandas as pd
 import torch
+from skimage.metrics import variation_of_information
 from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 # from torchmetrics import functional
 from models.unet2d import UNet2d
-from training.utils.dataloader_ninanjie import Dataset_2D_ninanjie_Train, load_train_dataset, collate_fn_2D_fib25_Train
-from utils.dataloader_ninanjie import Dataset_2D_ninanjie_Train
-from utils.dataloader_hemi_better import Dataset_2D_hemi_Train, collate_fn_2D_hemi_Train
+from training.models.ACRLSD import ACRLSD_2D
+from training.utils.aftercare import visualize_and_save_affinity, normalize_affinity
+from training.utils.dataloader_ninanjie import load_train_dataset, collate_fn_2D_fib25_Train
 
 
 # from utils.dataloader_cremi import Dataset_2D_cremi_Train,collate_fn_2D_cremi_Train
@@ -32,57 +37,28 @@ def set_seed(seed=19260817):
     torch.backends.cudnn.deterministics = True
 
 
-####ACRLSD模型
-class ACRLSD(torch.nn.Module):
-    def __init__(
-            self,
-    ):
-        super(ACRLSD, self).__init__()
-
-        # create our network, 1 input channels in the raw data
-        self.model_lsds = UNet2d(
-            in_channels=1,  # 输入的图像通道数
-            num_fmaps=12,
-            fmap_inc_factors=5,
-            downsample_factors=[[2, 2], [2, 2], [2, 2]],  # 降采样的因子
-            padding='same',
-            constant_upsample=True).to(device)
-
-        self.lsd_predict = torch.nn.Conv2d(in_channels=12, out_channels=6, kernel_size=1)  # 最终输出层的卷积操作
-
-        # create our network, 6 input channels in the lsds data and 1 input channels in the raw data
-        self.model_affinity = UNet2d(
-            in_channels=7,  # 输入的图像通道数
-            num_fmaps=12,
-            fmap_inc_factors=5,
-            downsample_factors=[[2, 2], [2, 2], [2, 2]],  # 降采样的因子
-            padding='same',
-            constant_upsample=True).to(device)
-
-        self.affinity_predict = torch.nn.Conv2d(in_channels=12, out_channels=2, kernel_size=1)  # 最终输出层的卷积操作
-
-    def forward(self, x):
-        y_lsds = self.lsd_predict(self.model_lsds(x))
-
-        y_concat = torch.cat([x, y_lsds.detach()], dim=1)
-
-        y_affinity = self.affinity_predict(self.model_affinity(y_concat))
-
-        return y_lsds, y_affinity
-
-
-def model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation, train_step=True):
+def model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
+               scaler=None, train_step=True, auto_loss=False):
     if train_step:
         optimizer.zero_grad()
 
-    # forward
-    lsd_logits, affinity_logits = model(raw)
-
-    loss_value = loss_fn(lsd_logits, gt_lsds) + loss_fn(affinity_logits, gt_affinity)
+    with torch.cuda.amp.autocast(enabled=scaler is not None):
+        lsd_logits, affinity_logits = model(raw)
+        loss1 = loss_fn(lsd_logits, gt_lsds)
+        loss2 = loss_fn(affinity_logits, gt_affinity)
+        if auto_loss:
+            loss_value = loss1 / (loss1.detach().item() + 1e-5) + loss2 / (loss2.detach().item() + 1e-5)
+        else:
+            loss_value = loss1 + loss2
 
     if train_step:
-        loss_value.backward()
-        optimizer.step()
+        if scaler is not None:
+            scaler.scale(loss_value).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss_value.backward()
+            optimizer.step()
 
     lsd_output = activation(lsd_logits)
     affinity_output = activation(affinity_logits)
@@ -96,7 +72,8 @@ def model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
     return loss_value, outputs
 
 
-def weighted_model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation, train_step=True):
+def weighted_model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
+                        scaler=None, train_step=True, auto_loss=False):
     if train_step:
         optimizer.zero_grad()
 
@@ -125,14 +102,14 @@ def weighted_model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, ac
 
     # 生成像素级权重矩阵（前景区域用fg_weight，背景用1.0）
     weights_affinity = torch.where(
-        torch.tensor(fg_mask_affinity == 1.0, device=gt_affinity.device),
-        torch.tensor(fg_weight_affinity, device=gt_affinity.device),
-        torch.tensor(1.0, device=gt_affinity.device)
+        torch.as_tensor(fg_mask_affinity == 1.0, device=gt_affinity.device),
+        torch.as_tensor(fg_weight_affinity, device=gt_affinity.device),
+        torch.as_tensor(1.0, device=gt_affinity.device)
     )
     weights_lsds = torch.where(
-        torch.tensor(fg_mask_lsds == 1.0, device=gt_lsds.device),
-        torch.tensor(fg_weight_lsds, device=gt_lsds.device),
-        torch.tensor(1.0, device=gt_lsds.device)
+        torch.as_tensor(fg_mask_lsds == 1.0, device=gt_lsds.device),
+        torch.as_tensor(fg_weight_lsds, device=gt_lsds.device),
+        torch.as_tensor(1.0, device=gt_lsds.device)
     )
 
     # --------------------------
@@ -171,71 +148,27 @@ def weighted_model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, ac
     return loss_value, outputs
 
 
-if __name__ == '__main__':
-    ##设置超参数
-    training_epochs = 10000
-    learning_rate = 1e-4
-    batch_size = 32
-
-    set_seed()
-
-    ###创建模型
-    # set device
-    os.environ['CUDA_VISIBLE_DEVICES'] = '3,4,5'
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    torch.backends.cudnn.benchmark = True
-    gpus = [i for i in range(len(os.environ['CUDA_VISIBLE_DEVICES'].split(',')))]
-
-    model = ACRLSD().to(device)
+def trainer(num_fmaps: int, fmap_inc_factors: int, downsample_times: int, weighted=False, auto_loss=False):
+    model = ACRLSD_2D(num_fmaps, fmap_inc_factors, downsample_times)
     model = torch.nn.DataParallel(model.cuda(), device_ids=gpus, output_device=gpus[0])
-    dataset_names = ['second_6', 'fourth_1']
-    class_num = 3
 
-    Save_Name = f'ACRLSD_2D(ninanjie)_subcell_{class_num}'
-
-    ##装载数据
-    crop_xyz = [4, 4, 1]
-    train_dataset, val_dataset = [], []
-    for dataset_name in dataset_names:
-        for i in range(crop_xyz[0]-1):
-            for j in range(crop_xyz[1]):
-                for k in range(crop_xyz[2]):
-                    train_tmp, val_tmp = load_train_dataset(dataset_name, raw_dir='raw', label_dir='export',
-                                                            from_temp=True, require_xz_yz=False, crop_size=512,
-                                                            crop_xyz=crop_xyz, chunk_position=[i, j, k])
-                    train_dataset.append(train_tmp)
-                    val_dataset.append(val_tmp)
-
-    train_dataset = ConcatDataset(train_dataset)
-    val_dataset = ConcatDataset(val_dataset)
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=48, pin_memory=True,
-                              drop_last=True, collate_fn=collate_fn_2D_fib25_Train)
-    val_loader = DataLoader(val_dataset, batch_size=(batch_size // 2) + 1, shuffle=False, num_workers=48,
-                            pin_memory=True, collate_fn=collate_fn_2D_fib25_Train)
-
-    def load_data_to_device(loader):
-        res = []
-        for raw, labels, point_map, mask, gt_affinity, gt_lsds in loader:
-            raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
-            gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
-            gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
-                                          device=device)  # (batch, 2, height, width)
-            res.append((raw, labels, point_map, mask, gt_affinity, gt_lsds))
-        return res
-    train_loader, val_loader = load_data_to_device(train_loader), load_data_to_device(val_loader)
+    # num_fmaps | fmap_inc_factors | downsample_factors
+    Save_Name = (f'ACRLSD_2D(ninanjie)_all/{crop_size}_{num_fmaps}_{fmap_inc_factors}_{downsample_times}/'
+                 f'{"auto" if auto_loss else "normal"}_{"weighted" if weighted else "unweighted"}')
 
     ##创建log日志
     logger = logging.getLogger()
     logger.handlers.clear()
     logger.setLevel(logging.INFO)
-    logfile = './output/log/log_{}.txt'.format(Save_Name)
-    csvfile = './output/log/log_{}.csv'.format(Save_Name)
+    output_dir = f'./output/log/{Save_Name}'
+    os.makedirs(output_dir, exist_ok=True)
+    logfile = f'{output_dir}/log.txt'
     fh = logging.FileHandler(logfile, mode='a', delay=False)
     fh.setLevel(logging.DEBUG)
     formatter = logging.Formatter("%(asctime)s - %(filename)s[line:%(lineno)d] - %(levelname)s: %(message)s")
     fh.setFormatter(formatter)
     logger.addHandler(fh)
+    writer = SummaryWriter(log_dir=output_dir)
 
     logging.info(f'''Starting training:
     training_epochs:  {training_epochs}
@@ -260,9 +193,11 @@ if __name__ == '__main__':
     epoch = 0
     Best_val_loss = 100000
     Best_epoch = 0
-    Best_model = None
-    early_stop_count = 100
+    early_stop_count = 50
     no_improve_count = 0
+
+    model_step_fn = weighted_model_step if weighted else model_step
+
     with tqdm(total=training_epochs) as pbar:
         progress_desc, train_desc, val_desc = '', '', ''
         while epoch < training_epochs:
@@ -276,14 +211,14 @@ if __name__ == '__main__':
             # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_loader:
             for raw, labels, point_map, mask, gt_affinity, gt_lsds in train_loader:
                 ##Get Tensor
-                # raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
-                # gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
-                # gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
-                #                               device=device)  # (batch, 2, height, width)
-                count = count + 1
+                raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
+                gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
+                gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
+                                              device=device)  # (batch, 2, height, width)
+                count += 1
                 progress_desc = f"Train {count}/{total}, "
                 train_desc = f"loss: {Best_val_loss:.4f}, "
-                loss_value, pred = weighted_model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation)
+                model_step_fn(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation)
                 pbar.set_description(progress_desc + train_desc + val_desc)
 
             ###################Validate###################
@@ -294,15 +229,22 @@ if __name__ == '__main__':
             random.seed(seed)
             acc_loss = []
             count, total = 0, len(val_loader)
+            voi_affinity = 0.
             # for raw, labels, Points_pos,Points_lab,Boxes,point_map,mask,gt_affinity,gt_lsds in tmp_val_loader:
             for raw, labels, point_map, mask, gt_affinity, gt_lsds in val_loader:
-                # raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
-                # gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
-                # gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
-                #                               device=device)  # (batch, 2, height, width)
+                raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
+                gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
+                gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.uint8,
+                                              device=device)  # (batch, 2, height, width)
                 with torch.no_grad():
-                    loss_value, _ = weighted_model_step(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
+                    loss_value, outputs = model_step_fn(model, loss_fn, optimizer, raw, gt_lsds, gt_affinity, activation,
                                                train_step=False)
+                # pred_lsds = outputs['pred_lsds']
+                pred_affinity = outputs['pred_affinity']
+                voi_affinity += np.sum(
+                    variation_of_information(np.asarray(gt_affinity.detach().cpu().numpy().flatten() * 255.0, dtype=np.uint8),
+                                             np.asarray(pred_affinity.detach().cpu().numpy().flatten() * 255.0, dtype=np.uint8))
+                )
                 count += 1
                 acc_loss.append(loss_value)
                 progress_desc = f"Val {count}/{total}, "
@@ -310,12 +252,32 @@ if __name__ == '__main__':
 
             # val_loss = np.mean(np.array([loss_value.cpu().numpy() for loss_value in acc_loss]))
             val_loss = torch.stack([loss_value.cpu() for loss_value in acc_loss]).mean().item()
+            voi_affinity /= total
+            writer.add_scalar('val/loss', val_loss, epoch)
+            writer.add_scalar('val/voi_affinity', voi_affinity, epoch)
+
+            random.seed(epoch)
+            sample_idx = random.randint(0, pred_affinity.shape[0] - 1)
+            pred_affinity = np.asarray(pred_affinity[sample_idx, ...].cpu().numpy() * 255.0, dtype=np.uint8) # (2, H, W)
+            pred_affinity_unify = normalize_affinity(pred_affinity) # (2, H, W)
+            gt_affinity = normalize_affinity(gt_affinity[sample_idx, ...].cpu().numpy() * 255.0) # (2, H, W)
+            visual_pred_affinity = np.sum(pred_affinity, axis=0) # (H, W)
+            visual_pred_affinity_unify = np.sum(pred_affinity_unify, axis=0)
+            visual_gt_affinity = np.sum(gt_affinity, axis=0)
+            # visual_raw = raw[batch_size >> 2, 0, ...].cpu().numpy()
+
+            visualize_and_save_affinity(visual_pred_affinity, epoch, 'visual/pred', writer)
+            visualize_and_save_affinity(visual_pred_affinity_unify, epoch, 'visual/pred_unify', writer)
+            visualize_and_save_affinity(visual_gt_affinity, epoch, 'visual/gt', writer)
+            # visualize_and_save_affinity(visual_raw, epoch, 'visual/raw', writer)
+            writer.flush()
 
             ###################Compare###################
             if Best_val_loss > val_loss:
                 Best_val_loss = val_loss
                 Best_epoch = epoch
                 Best_model = model.state_dict()
+                torch.save(Best_model, '{}/Best_in_val.model'.format(output_dir))
                 no_improve_count = 0
             else:
                 no_improve_count += 1
@@ -328,8 +290,68 @@ if __name__ == '__main__':
             pbar.update(1)
 
             ##Early stop
-            if no_improve_count == early_stop_count and epoch > 100:
+            if no_improve_count > early_stop_count and epoch > 100:
                 logging.info("Early stop!")
                 break
-    fh.flush()
-    torch.save(Best_model, './output/checkpoints/{}_Best_in_val.model'.format(Save_Name))
+            fh.flush()
+    del model, Best_model, optimizer, activation, loss_fn
+    torch.cuda.empty_cache()
+    gc.collect()
+
+
+if __name__ == '__main__':
+    ##设置超参数
+    training_epochs = 10000
+    learning_rate = 1e-4
+    batch_size = 20
+
+    set_seed()
+
+    ###创建模型
+    # set device
+    os.environ['CUDA_VISIBLE_DEVICES'] = '2,1,5,0,3'
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True
+    gpus = [i for i in range(len(os.environ['CUDA_VISIBLE_DEVICES'].split(',')))]
+
+    ##装载数据
+    crop_size = 512
+    dataset_names = ['best_val_3']
+    crop_xyz = [7, 7, 1]
+    train_dataset, val_dataset = [], []
+    for dataset_name, i, j, k in itertools.product(
+            dataset_names,
+            range(crop_xyz[0]),
+            range(crop_xyz[1]),
+            range(crop_xyz[2])
+    ):
+        train_tmp, val_tmp = load_train_dataset(dataset_name, raw_dir='raw_2',
+                                                label_dir='truth_label_2_seg_1',
+                                                from_temp=True, require_xz_yz=False, crop_size=crop_size,
+                                                crop_xyz=crop_xyz, chunk_position=[i, j, k])
+        train_dataset.append(train_tmp)
+        val_dataset.append(val_tmp)
+
+    train_dataset = ConcatDataset(train_dataset)
+    val_dataset = ConcatDataset(val_dataset)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=28, pin_memory=True,
+                              drop_last=True, collate_fn=collate_fn_2D_fib25_Train)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=28,
+                            pin_memory=True, collate_fn=collate_fn_2D_fib25_Train)
+
+    def load_data_to_device(loader):
+        res = []
+        for raw, labels, point_map, mask, gt_affinity, gt_lsds in loader:
+            raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
+            gt_lsds = torch.as_tensor(gt_lsds, dtype=torch.float, device=device)  # (batch, 6, height, width)
+            gt_affinity = torch.as_tensor(gt_affinity, dtype=torch.float,
+                                          device=device)  # (batch, 2, height, width)
+            res.append((raw, labels, point_map, mask, gt_affinity, gt_lsds))
+        return res
+
+    # train_loader, val_loader = load_data_to_device(train_loader), load_data_to_device(val_loader)
+
+    trainer(num_fmaps=32, fmap_inc_factors=5, downsample_times=3, weighted=True, auto_loss=True)
+    # trainer(num_fmaps=32, fmap_inc_factors=5, downsample_times=3, weighted=False, auto_loss=True)
+    # trainer()

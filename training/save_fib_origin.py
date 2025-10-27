@@ -20,7 +20,7 @@ HOME_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 def visualize_and_save_mask(raw, mask, idx=0, mode='origin',
                             background_color=(0, 0, 0), seed=98):
     from skimage.measure import label
-    output_path = os.path.join(output_dir, f"{mode}_{str(idx).zfill(5)}.tif")
+    output_path = os.path.join(output_dir, f"{mode}_{str(idx).zfill(5)}.png")
 
     # mask = mask > 127
     # segmentation = label(np.asarray(0 + mask)[:, :])
@@ -104,6 +104,7 @@ def visualize_dataset(raw, labels):
         single_mask = single_mask.squeeze().astype(np.uint16)
         processes.append(pool.apply_async(visualize_and_save_mask,
                                               args=(single_raw, single_mask, idx + count * batch_size)))
+        break
 
     with tqdm(total=len(processes), leave=False, desc="saving") as pbar:
         for process in processes:
@@ -118,7 +119,7 @@ if __name__ == '__main__':
     dataset_name = 'best_val_3'
     raw_dirs = ['raw_2']
     # label_dirs = ['train_probability_tz']
-    label_dirs = ['truth_label_2_seg_1']
+    label_dirs = ['multicut/3']
     for raw_dir in raw_dirs:
         for label_dir in label_dirs:
             test_dataset = Dataset_2D_ninanjie_Origin(data_dir=os.path.join(ninanjie_data, 'train'),
@@ -129,7 +130,7 @@ if __name__ == '__main__':
                                        pin_memory=True, drop_last=False, collate_fn=collate_fn_2D_fib25_Test)
 
             # output_dir = os.path.join(HOME_PATH, f'data/ninanjie/train/{dataset_name}/label_2')
-            output_dir = os.path.join(HOME_PATH, f'data/ninanjie/train/{dataset_name}/visual/{label_dir}')
+            output_dir = os.path.join(HOME_PATH, f'data/ninanjie/train/{dataset_name}/visual/{label_dir.replace("/", "_")}')
             os.makedirs(output_dir, exist_ok=True)
 
             count = 0

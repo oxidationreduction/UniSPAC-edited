@@ -53,24 +53,24 @@ class ACRLSD(torch.nn.Module):
         # create our network, 1 input channels in the raw data
         self.model_lsds = UNet2d(
             in_channels=1,  # 输入的图像通道数
-            num_fmaps=12,
-            fmap_inc_factors=5,
-            downsample_factors=[[2, 2], [2, 2], [2, 2]],  # 降采样的因子
+            num_fmaps=24,
+            fmap_inc_factors=3,
+            downsample_factors=[[2, 2] for _ in range(4)],  # 降采样的因子
             padding='same',
             constant_upsample=True).to(device)
 
-        self.lsd_predict = torch.nn.Conv2d(in_channels=12, out_channels=6, kernel_size=1)  # 最终输出层的卷积操作
+        self.lsd_predict = torch.nn.Conv2d(in_channels=24, out_channels=6, kernel_size=1)  # 最终输出层的卷积操作
 
         # create our network, 6 input channels in the lsds data and 1 input channels in the raw data
         self.model_affinity = UNet2d(
             in_channels=7,  # 输入的图像通道数
-            num_fmaps=12,
-            fmap_inc_factors=5,
-            downsample_factors=[[2, 2], [2, 2], [2, 2]],  # 降采样的因子
+            num_fmaps=24,
+            fmap_inc_factors=3,
+            downsample_factors=[[2, 2] for _ in range(4)],  # 降采样的因子
             padding='same',
             constant_upsample=True).to(device)
 
-        self.affinity_predict = torch.nn.Conv2d(in_channels=12, out_channels=2, kernel_size=1)  # 最终输出层的卷积操作
+        self.affinity_predict = torch.nn.Conv2d(in_channels=24, out_channels=2, kernel_size=1)  # 最终输出层的卷积操作
 
     def forward(self, x):
         y_lsds = self.lsd_predict(self.model_lsds(x))
@@ -100,8 +100,8 @@ class segEM2d(torch.nn.Module):
         ##For affinity prediction
         self.model_affinity = ACRLSD()
         # model_path = './output/checkpoints/ACRLSD_2D(hemi+fib25+cremi)_Best_in_val.model'
-        model_path = ('/home/liuhongyu2024/Documents/UniSPAC-edited/'
-                      'training/output/checkpoints/ACRLSD_2D(ninanjie)_half_crop_Best_in_val.model')
+        model_path = ('/home/liuhongyu2024/Documents/UniSPAC-edited/training/output/log/'
+                      'ACRLSD_2D(ninanjie)_all/24_3_4/normal/Best_in_val.model')
         weights = torch.load(model_path, map_location=torch.device('cuda'))
         self.model_affinity.load_state_dict(remove_module(weights))
         for param in self.model_affinity.parameters():
@@ -110,13 +110,13 @@ class segEM2d(torch.nn.Module):
         # create our network, 2 input channels in the affinity data and 1 input channels in the raw data
         self.model_mask = UNet2d(
             in_channels=3,  # 输入的图像通道数
-            num_fmaps=12,
-            fmap_inc_factors=5,
-            downsample_factors=[[2, 2], [2, 2], [2, 2]],  # 降采样的因子
+            num_fmaps=24,
+            fmap_inc_factors=4,
+            downsample_factors=[[2, 2] for _ in range(4)],  # 降采样的因子
             padding='same',
             constant_upsample=True)
 
-        self.mask_predict = torch.nn.Conv2d(in_channels=12, out_channels=1, kernel_size=1)  # 最终输出层的卷积操作
+        self.mask_predict = torch.nn.Conv2d(in_channels=24, out_channels=1, kernel_size=1)  # 最终输出层的卷积操作
 
         self.sigmoid = torch.nn.Sigmoid()
 
@@ -135,8 +135,10 @@ def visualize_and_save_mask(raw, segmentation, idx=0, mode='origin',
                             background_color=(0, 0, 0), seed=98):
     import matplotlib.pyplot as plt
     # 获取所有实例标签（排除背景0）
-    output_path = os.path.join(HOME_PATH,
-                               f'data/ninanjie/train/second_6/output_{WEIGHT_LOSS2}', f"{mode}_{str(idx).zfill(4)}.png")
+    output_path = os.path.join(HOME_PATH, f'data/ninanjie/train/{dataset_names[0]}/output_{WEIGHT_LOSS2}')
+    os.makedirs(output_path, exist_ok=True)
+    output_path = os.path.join(output_path,
+                               f"{mode}_{str(idx).zfill(4)}.png")
 
     # 获取所有实例标签（排除背景0）
     if mode == 'seg_only':
@@ -188,7 +190,9 @@ def save_mask(mask, idx=0):
     import os
 
     # 定义输出路径
-    output_path = os.path.join(HOME_PATH, f'data/ninanjie/train/second_6/mask',
+    output_path = os.path.join(HOME_PATH, f'data/ninanjie/train/{dataset_names[0]}/mask')
+    os.makedirs(output_path, exist_ok=True)
+    output_path = os.path.join(output_path,
                                f"{str(idx).zfill(4)}.tif")
 
     if mask.dtype not in (np.uint8, np.uint16):
@@ -326,23 +330,24 @@ def morphological_closing(x: torch.Tensor, kernel: torch.Tensor, iterations: int
 
 if __name__ == '__main__':
     ##设置超参数
-    batch_size = 3
+    batch_size = 1
 
     set_seed()
-    os.environ['CUDA_VISIBLE_DEVICES'] = '4,5,3'  # 设置所有可以使用的显卡，共计四块
+    os.environ['CUDA_VISIBLE_DEVICES'] = '2'  # 设置所有可以使用的显卡，共计四块
     device_ids = [i for i in range(len(os.environ['CUDA_VISIBLE_DEVICES'].split(',')))]  # 选中显卡
     device = torch.device(f"cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
 
     # load trained model weights
     model_path = os.path.join(HOME_PATH,
-                              f'training/output/checkpoints/segEM2d(ninanjie)-w2-2-w3-1_Best_in_val.model')
+                              f'/home/liuhongyu2024/Documents/UniSPAC-edited/training/output/log/'
+                              f'segEM2d(ninanjie)-prompt-3rd-1/weighted-w2-5-w3-1/24_3_4/Best_in_val.model')
     model = segEM2d().to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model = nn.DataParallel(model, device_ids=device_ids, output_device=device)
 
     ##装载数据
-    class_num = 1
+    class_num = None
     dataset_names = ['second_6']
     # Save_Name = 'segEM2d(ninanjie)_subcell_{}-w2-{}-w3-{}_512'.format(class_num, WEIGHT_LOSS2, WEIGHT_LOSS3)
 
@@ -357,8 +362,8 @@ if __name__ == '__main__':
                 range(crop_xyz[2])
         ):
             test_tmp = load_test_dataset(dataset_name, raw_dir='raw', label_dir='export',
-                                                       from_temp=False, semantic_class_num=class_num,
-                                                       crop_xyz=crop_xyz, chunk_position=[i, j, k])
+                                         from_temp=False, semantic_class_num=class_num,
+                                         crop_xyz=crop_xyz, chunk_position=[i, j, k])
             test_dataset.append(test_tmp)
 
     test_dataset = ConcatDataset(test_dataset)
@@ -371,7 +376,7 @@ if __name__ == '__main__':
             ##Get Tensor
             raw = torch.as_tensor(raw, dtype=torch.float, device=device)  # (batch, 1, height, width)
             point_map = torch.as_tensor(point_map, dtype=torch.float, device=device)  # (batch, height, width)
-            gt_labels = torch.as_tensor(gt_labels, dtype=torch.float, device=device)  # (batch, height, width)
+            # gt_labels = torch.as_tensor(gt_labels, dtype=torch.float, device=device)  # (batch, height, width)
             res.append([raw, point_map, gt_labels])
         return res
 
@@ -396,7 +401,7 @@ if __name__ == '__main__':
 
     with (torch.no_grad()):
         base_idx = 0
-        for raw, point_map, gt_seg in tqdm(test_loader, leave=True, desc='testing'):
+        for raw, point_map, _ in tqdm(test_loader, leave=True, desc='testing'):
             y_mask, y_lsds, y_affinity = model(raw, point_map)
             y_mask = y_mask.detach().cpu()
             binary_y_mask = (y_mask > 0.5) + 0

@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import torch
+from matplotlib import pyplot as plt
 from scipy.ndimage import binary_fill_holes
 from skimage import measure
 from torch.nn import functional as F
@@ -19,12 +20,14 @@ def aftercare(y_mask: torch.Tensor):
         处理后的分割结果张量
     """
     # 确保输入是浮点型张量
-    y_mask = y_mask + 0.
-    device = y_mask.device
+    y_mask = y_mask + 0. # (1, B, H, W, N)
+    if y_mask.ndim == 5:
+        y_mask = y_mask.squeeze(0)  # (B, H, W, N)
+    device = torch.device('cpu')
     batch_size = y_mask.size(0)
 
     # 根据输入形状确定是否为多层结构
-    is_multi_layer = len(y_mask.shape) == 4  # (B, N, H, W)
+    # is_multi_layer = len(y_mask.shape) >= 4  # (B, N, H, W)
 
     # 定义结构元素（3x3的十字形结构，适合生物组织的连接性）
     kernel = torch.tensor([[0, 1, 0],
@@ -37,47 +40,53 @@ def aftercare(y_mask: torch.Tensor):
 
     # 对每个样本进行处理
     for b in range(batch_size):
-        if is_multi_layer:
-            # 多层结构: (B, N, H, W)
-            layers = []
-            for n in range(y_mask.size(1)):
-                layer = y_mask[b, n].unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
-                processed_layer = process_single_layer(layer, device=device, kernel=kernel)
-                layers.append(processed_layer)
-            # 堆叠处理后的多层
-            result.append(torch.cat(layers, dim=1))
-        else:
-            # 单层结构: (B, H, W)
-            layer = y_mask[b].unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
-            processed_layer = process_single_layer(layer, device=device, kernel=kernel)
-            result.append(processed_layer.squeeze(0))  # 移除通道维度
+        # 多层结构: (B, N, H, W)
+        y_mask_ = y_mask[b].permute(2, 0, 1)  # (N, H, W)
+        layers = []
+        for n in range(y_mask_.size(0)):
+            layer = y_mask_[n]   # [H, W]
+            processed_layer = process_single_layer(layer, device=device, kernel=kernel, erosion=True) # (1, H, W)
+            layers.append(processed_layer)
+        # 堆叠处理后的多层
+        chunk = torch.cat(layers, dim=0).to(device) # (N, H, W)
+        chunk = torch.as_tensor(measure.label(np.asarray(chunk))) # relabel
+        layers = []
+        for n in range(chunk.size(0)):
+            layer = y_mask_[n]  # [H, W]
+            processed_layer = process_single_layer(layer, device=device, kernel=kernel, erosion=False)  # (1, H, W)
+            layers.append(processed_layer)
+        chunk = torch.cat(layers, dim=0).to(device).permute(1, 2, 0).unsqueeze(0) # (1, H, W, N)
+        result.append(chunk) # (1, H, W, N) each
 
     # 堆叠所有样本
-    result = torch.stack(result, dim=0)
+    result = torch.cat(result, dim=0).unsqueeze(0) # (1, B, H, W, N)
 
     # 确保输出仍是0和1的二进制张量
     return np.asarray(result.cpu())
 
 
-def process_single_layer(layer: torch.Tensor, device, kernel):
+def process_single_layer(layer: torch.Tensor, device, kernel, erosion=False):
     """处理单个图层，执行填充空心和圆化操作"""
-    layer = np.asarray(layer.cpu())
+    layer = np.asarray(layer.cpu()) # (H, W)
 
-    # 0. 过滤小目标
-    min_size = 50
+    min_size = 1000
     labels, counts = np.unique(layer, return_counts=True)
     label_counts = dict(zip(labels, counts))
-    layer_new = torch.zeros_like(torch.as_tensor(layer), dtype=torch.int32)
-    for label, count in label_counts.items():
-        if count > min_size:
-            mask = torch.as_tensor(binary_fill_holes(layer == label),
-                                   dtype=torch.float32, device=torch.device('cuda'))
-            mask = morphological_dilation(mask, kernel)
-            mask = morphological_erosion(mask, kernel)
-            mask = mask == 1.
-            layer_new[mask] = int(label)
+    layer_new = torch.zeros_like(torch.as_tensor(layer), dtype=torch.int32, device=device) # (H, W)
 
-    return layer_new
+    morphological_op = morphological_erosion if erosion else morphological_dilation
+
+    if 0.0 in label_counts.keys():
+        label_counts.pop(0.0)
+    for label, count in label_counts.items():  # 跳过背景0
+        if count > min_size:
+            mask = torch.as_tensor(binary_fill_holes(layer == label) + 0., dtype=torch.float32, device=device).unsqueeze(0)
+            # mask = morphological_dilation(mask, kernel) # (1, H, W)
+            mask = morphological_op(mask, kernel)
+            mask = (mask == 1.).squeeze(0) # (H, W)
+            layer_new[mask] = 1
+
+    return layer_new.unsqueeze(0)
 
 
 def morphological_dilation(x: torch.Tensor, kernel: torch.Tensor):
@@ -125,6 +134,7 @@ def visualize_and_save_mask(raw: torch.Tensor, segmentation: torch.Tensor, idx=0
     import numpy as np
     from matplotlib.colors import ListedColormap
 
+    # After this if-else block, raw is (H, W), segmentation is (H, W) with labeled instances
     raw = np.asarray(raw).squeeze()
     if raw.ndim == 4:
         raw = raw.transpose(0, 3, 1, 2)[1, 0, ...].squeeze()
@@ -133,6 +143,10 @@ def visualize_and_save_mask(raw: torch.Tensor, segmentation: torch.Tensor, idx=0
     elif raw.ndim == 3:
         raw = raw[1, ...].squeeze()
         segmentation = np.asarray(segmentation, dtype=np.int32).squeeze()[1, ...].squeeze()
+        segmentation = measure.label(segmentation)
+    elif raw.ndim == 2:
+        raw = raw.squeeze()
+        segmentation = np.asarray(segmentation, dtype=np.int32).squeeze()
         segmentation = measure.label(segmentation)
     else:
         raise AssertionError('unexpected raw shape')
@@ -173,6 +187,29 @@ def visualize_and_save_mask(raw: torch.Tensor, segmentation: torch.Tensor, idx=0
     # 显示分割结果（仅显示非背景区域）
     masked_segmentation = np.ma.masked_where(segmentation == 0, segmentation)
     plt.imshow(masked_segmentation, cmap=cmap, alpha=0.5)  # alpha控制透明度
+    # 获取当前坐标轴，用于添加圆形和文本
+    ax = plt.gca()
+
+    # 为每个实例添加中心红色圆形和编号
+    for label in instances:
+        # 找到该实例的所有像素坐标
+        coords = np.where(segmentation == label)
+
+        # 计算中心坐标（平均位置）
+        if len(coords[0]) > 0:  # 确保实例有像素
+            center_y = int(np.mean(coords[0]))
+            center_x = int(np.mean(coords[1]))
+
+            # 添加红色圆形
+            circle = plt.Circle((center_x, center_y), radius=20, color='red', fill=True)
+            ax.add_patch(circle)
+
+            # 添加数字编号（白色文本，居中显示）
+            plt.text(center_x, center_y, str(int(label)),
+                     color='white', fontsize=35,
+                     ha='center', va='center',
+                     fontweight='bold')
+
     plt.axis('off')  # 关闭坐标轴
     plt.tight_layout(pad=0)  # 去除边距
 
@@ -199,6 +236,92 @@ def visualize_and_save_mask(raw: torch.Tensor, segmentation: torch.Tensor, idx=0
         writer.add_image(mode, img_array, global_step=idx, dataformats='CHW')
 
     plt.close()
+
+def visualize_and_save_affinity(affinity: np.ndarray, idx=0, mode='origin', writer=None):
+    """
+    可视化亲和力图，并可选择保存为图片或写入TensorBoard
+    参数:
+        affinity: 亲和力图张量
+        idx: 图像索引，用于命名
+        mode: 可视化模式
+        writer: TensorBoard的SummaryWriter实例，如果提供则写入TensorBoard
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.colors import ListedColormap
+    import io
+    from PIL import Image
+
+    # 将图像保存到内存缓冲区
+    plt.imshow(affinity.squeeze(), cmap='gray')
+    plt.axis('off')  # 关闭坐标轴
+    plt.tight_layout(pad=0)  # 去除边距
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='jpg', bbox_inches='tight', pad_inches=0, dpi=300)
+    buf.seek(0)
+
+    # 转换为PIL图像并再转换为numpy数组
+    img = Image.open(buf)
+    img_array = np.array(img)
+
+    # 写入TensorBoard，注意需要调整通道顺序为[C, H, W]
+    if img_array.ndim == 3:
+        img_array = img_array.transpose(2, 0, 1)
+
+    # 添加到TensorBoard，使用idx作为全局步长
+    writer.add_image(mode, img_array, global_step=idx, dataformats='CHW')
+    plt.close()
+
+
+def normalize_affinity(affinity: np.ndarray) -> np.ndarray:
+    """Normalize affinity values to the range [0, 1]."""
+    min_val = np.min(affinity)
+    max_val = np.max(affinity)
+    if min_val == max_val:
+        return np.zeros_like(affinity)
+    normalized = (affinity - min_val) / (max_val - min_val)
+    return normalized
+
+
+def calculate_batch_voi(preds, gts):
+    """
+    批量计算VOI.
+    preds 可能是 4 维或以上的数据，需要转换为 3 维度才能使用 variation of information 计算。无论维度多少，都要使用循环，最内层循环计算 3 维 VOI。
+    参数:
+        preds: 预测标签张量
+        gts: 真实标签张量
+    返回:
+        mean_voi: 平均VOI值
+    """
+    preds = torch.as_tensor(preds, dtype=torch.long)
+    gts = torch.as_tensor(gts, dtype=torch.long)
+    assert preds.shape[0] == gts.shape[0], "批量大小不匹配"
+    batch_size = preds.shape[0]
+    voi_list = []
+
+    # 遍历批量中的每个样本
+    for i in range(batch_size):
+        pred = preds[i]
+        gt = gts[i]
+
+        # 如果有多余维度，压缩到3维 (H, W, N)
+        if pred.ndim > 3:
+            pred = pred.permute(1, 2, 0).contiguous()  # (H, W, N)
+        if gt.ndim > 3:
+            gt = gt.permute(1, 2, 0).contiguous()  # (H, W, N)
+
+        # 对每个通道计算VOI并取平均
+        channel_voi = []
+        for n in range(pred.shape[-1]):
+            voi = calculate_multi_class_voi(pred[..., n], gt[..., n])
+            channel_voi.append(voi)
+        mean_channel_voi = np.mean(channel_voi) if channel_voi else 0.0
+        voi_list.append(mean_channel_voi)
+
+    mean_voi = np.mean(voi_list) if voi_list else 0.0
+    return voi_list, mean_voi
+
 
 def calculate_multi_class_voi(pred, gt):
     """
